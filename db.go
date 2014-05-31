@@ -1,9 +1,7 @@
 package main
 
 import (
-	"github.com/couchbaselabs/go-couchbase"
 	r "github.com/dancannon/gorethink"
-	"labix.org/v2/mgo"
 	"log"
 	"time"
 )
@@ -16,14 +14,6 @@ func connect(s Storer) {
 func add(s Storer) {
 	//s.Add(Data interface{})
 
-}
-
-func NewMongo() *Mongo {
-	return &Mongo{}
-}
-
-func NewCouchBase() *CouchB {
-	return &CouchB{}
 }
 
 func NewReThink() *ReThink {
@@ -50,162 +40,11 @@ type DBModder interface {
 
 type DBFinder interface {
 	FindAll(data interface{}, result interface{})
-	FindByID(id string, data interface{})
+	FindByID(id string, data interface{}) bool
 }
 
 type DBConner interface {
 	Conn()
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-// MongoDB
-//
-//
-//////////////////////////////////////////////////////////////////////////
-type Mongo struct {
-	url         string
-	port        string
-	dbName      string
-	collectName string
-	session     *mgo.Session
-	collection  *mgo.Collection
-}
-
-func (m *Mongo) Conn() {
-
-	sess, err := mgo.Dial(m.url + ":" + m.port)
-	if err != nil {
-		log.Fatal("MongoDB-connectDB:", err)
-	}
-
-	sess.SetMode(mgo.Monotonic, true)
-
-	m.session = sess
-}
-
-func (m *Mongo) Add(tableName string, data interface{}) {
-
-	ses := m.session.Clone() //clone or copy? the session for every request
-	defer ses.Close()        //close the session when function is complete.
-
-	//how to change db or collections between calls to add?
-	//Or set all ahead of time in envVar? create separte instance of storer ?
-	col := ses.DB(m.dbName).C(m.collectName)
-	m.collection = col
-
-	log.Println("db-add")
-	//newId := bson.NewObjectId()
-	//jsonData.DeviceId = newId
-	//err := col.Insert(&jsonData)
-}
-
-func (m *Mongo) FindAll(data interface{}, result interface{}) {
-	ses := m.session.Clone()
-	defer ses.Close()
-
-	log.Println("db-FindAll")
-	//return nil
-}
-
-func (m *Mongo) FindByID(id string, data interface{}) {
-	ses := m.session.Clone()
-	defer ses.Close()
-
-	log.Println("db-FindById")
-
-	//return nil
-}
-
-func (m *Mongo) UpdateByID(id string, data interface{}) {
-	ses := m.session.Clone()
-	defer ses.Close()
-
-	log.Println("db-UpdateById")
-}
-
-func (m *Mongo) DelByID(id string) {
-	ses := m.session.Clone()
-	defer ses.Close()
-
-	log.Println("db-DelById")
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-// CouchBase
-//
-//
-//////////////////////////////////////////////////////////////////////////
-type CouchB struct {
-	userName   string
-	pass       string
-	url        string
-	port       string
-	poolName   string
-	bucketName string
-	client     *couchbase.Client
-	bucket     *couchbase.Bucket
-}
-
-func (cb *CouchB) Conn() {
-
-	con, err := couchbase.Connect("http://" + cb.userName + ":" + cb.pass + "@" + cb.url + ":" + cb.port)
-	//con, err := couchbase.Connect("http://" + cb.url + ":" + cb.port)
-
-	if err != nil {
-		log.Fatalf("couch Base Error connecting:  %v", err)
-	}
-
-	pool, err := con.GetPool(cb.poolName)
-	if err != nil {
-		log.Printf("couch Base - Pool Error, %v", err)
-	}
-
-	bt, err := pool.GetBucket(cb.bucketName)
-
-	if err != nil {
-		log.Printf("couch Base - Bucket Error, %v", err)
-	}
-
-	cb.bucket = bt
-	cb.client = &con
-
-}
-
-func (cb *CouchB) Add(tableName string, data interface{}) {
-
-	//_, err := cb.bucket.Add("key", 10, &data)
-	//if err != nil {
-	//	log.Printf("couchbase Add-Error:%v", err)
-	//}
-	//log.Printf("data:%v", data)
-	//cb.bucket.Set("someKey", []string{"an", "example", "list"})
-
-	//log.Println("db-add")
-
-}
-
-func (cb *CouchB) FindAll(data interface{}, result interface{}) {
-
-	log.Println("db-FindAll")
-	//return nil
-}
-
-func (cb *CouchB) FindByID(id string, data interface{}) {
-
-	log.Println("db-FindById")
-	//return nil
-}
-
-func (cb *CouchB) UpdateByID(id string, data interface{}) {
-
-	log.Println("db-UpdateById")
-}
-
-func (cb *CouchB) DelByID(id string) {
-
-	log.Println("db-DelById")
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -320,7 +159,7 @@ func (rt *ReThink) FindAll(data interface{}, result interface{}) {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func (rt *ReThink) FindByID(id string, data interface{}) {
+func (rt *ReThink) FindByID(id string, data interface{}) bool {
 
 	log.Printf("db-FindById:%s", id)
 	row, err := r.Table(rt.tableName).
@@ -331,11 +170,17 @@ func (rt *ReThink) FindByID(id string, data interface{}) {
 		log.Printf("Error Finding by ID: %s", err)
 	}
 
+	if row.IsNil() {
+		return false
+	}
+
 	//var response beacon
 	err = row.Scan(&data)
 	if err != nil {
 		log.Printf(err.Error())
 	}
+
+	return true
 
 }
 

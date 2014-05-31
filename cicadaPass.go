@@ -2,7 +2,10 @@ package main
 
 import (
 	"archive/zip"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -11,7 +14,6 @@ import (
 	"github.com/zenazn/goji/web"
 	"hash/fnv"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"path"
@@ -19,10 +21,19 @@ import (
 	"time"
 )
 
+var tokenPrivateKey string
+
 func main() {
 
+	tokenPrivateKey = `y0yArOR5I\)rZT8Kj6NaaJs;{T:h0p1` //TODO: lets make a new key and put this somewhere safer!
+
 	goji.Post("/pass", createPass)
-	goji.Get("/pass/:id", getPassById)
+	goji.Get("/pass/:version/passes/:passTypeIdentifier", getByPassTypeId)
+	goji.Get("/pass/:version/passes/:passTypeIdentifier/:serialNumber", getLatestByPassTypeId)
+	goji.Post("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier/:serialNumber", registerDevicePass)
+	goji.Get("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier/", getPassSerialbyDevice)
+	goji.Delete("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier/:serialNumber", unregisterDevice)
+	goji.Post("/pass/:version/log", logErrors)
 
 	goji.NotFound(NotFound)
 
@@ -33,62 +44,33 @@ func main() {
 
 //////////////////////////////////////////////////////////////////////////
 //
-//	createPass Handler
 //
-//
-//////////////////////////////////////////////////////////////////////////
-func createPass(c web.C, res http.ResponseWriter, req *http.Request) {
-
-	db, err := getDbType(c)
-	if err != nil {
-		log.Println(err.Error())
-	}
-
-	var newPass pass
-
-	readJson(req, &newPass.KeyDoc) //TODO: create schema to validate data is correct
-
-	uri, err := encodetoDataUri("icon.png", ".png")
-	check(err)
-	var image passImage
-	image.ImageData = uri
-	image.ImageName = "icon"
-	newPass.Images = append(newPass.Images, image)
-
-	//Unique Id for the db and the pass file name
-	idHash := generateFnvHashId(newPass.KeyDoc.Description, time.Now().String())  //generate a hash using pass description + time
-	companyName := strings.Replace(newPass.KeyDoc.OrganizationName, " ", "-", -1) //remove spaces from organization name
-	newPass.Id = fmt.Sprintf("%s-%d", companyName, idHash)
-
-	db.Add("pass", &newPass)
-
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//	createPass Handler
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func getPassById(c web.C, res http.ResponseWriter, req *http.Request) {
-
-	log.Println("getPassById")
-
-	db, err := getDbType(c)
-	if err != nil {
-		log.Println(err.Error())
-	}
+func generatePass(passTypeId string, serialNum string, res http.ResponseWriter, db Storer) {
 
 	var dlPass pass
 
-	db.FindByID(c.URLParams["id"], &dlPass)
+	if !db.FindByID(passTypeId, &dlPass) {
+		http.Error(res, "pass type not found", 404)
+		return
+	}
 
-	//generate a unique serial number for this pass being downloaded
-	idHash := generateFnvHashId(req.UserAgent(), time.Now().String())
-	dlPass.KeyDoc.SerialNumber = fmt.Sprintf("%d", idHash)
+	dlPass.KeyDoc.SerialNumber = serialNum
+
+	//fmt.Sprintf("%d", dlPass.Updated.Unix())
+	//generate auth token - Don’t change the authentication token in an update.
+	dlPass.KeyDoc.AuthenticationToken = generateAuthToken(tokenPrivateKey, serialNum, passTypeId)
+	//log.Printf("authtoken: ", dlPass.KeyDoc.AuthenticationToken)
+
+	//TODO: save serial + other info to db.
+
+	//make manifestdoc map for storing sha1 hashes
+	dlPass.ManifestDoc = make(map[string]string)
 
 	// Create a new zip archive.
-	res.Header().Set("Content-Type", "application/vnd.apple.pkpass")
+	res.Header().Set("Content-Type", "application/vnd.apple.pkpass") //sets the extension to pkpass
 	w := zip.NewWriter(res)
 	defer w.Close()
 
@@ -97,14 +79,29 @@ func getPassById(c web.C, res http.ResponseWriter, req *http.Request) {
 	enc := json.NewEncoder(file)
 	enc.Encode(dlPass.KeyDoc)
 
+	//compute sha1 hash for pass.json
+	dlPass.ManifestDoc["pass.json"] = fmt.Sprintf("%x", hashSha1Json(dlPass.KeyDoc))
+
 	//add all images to the pass zip
 	for i := range dlPass.Images {
 
 		fileExt, imageBytes := decodetoBytes(dlPass.Images[i].ImageData)
-		file = addToZipFile(w, dlPass.Images[i].ImageName+fileExt)
-		_, err = file.Write(imageBytes)
+		fileName := dlPass.Images[i].ImageName + fileExt
+		file = addToZipFile(w, fileName)
+		_, err := file.Write(imageBytes)
 		check(err)
+
+		//compute sha1 hash for each image file, add to manifest doc
+		dlPass.ManifestDoc[fileName] = fmt.Sprintf("%x", hashSha1Bytes(imageBytes))
 	}
+
+	//add the manifest.json file to the zip pass
+	file = addToZipFile(w, "manifest.json")
+	enc = json.NewEncoder(file)
+	enc.Encode(dlPass.ManifestDoc)
+	debugPrintJson(dlPass.ManifestDoc)
+
+	//TODO: sign pass
 
 }
 
@@ -140,8 +137,41 @@ func addToZipFile(zWrite *zip.Writer, fileName string) io.Writer {
 
 //////////////////////////////////////////////////////////////////////////
 //
-//	generate a hash fnv1a hash. Fast, unique, but insecure! use only for ids and such.
 //
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func hashSha1Json(jsonData interface{}) []byte {
+
+	//compute sha1 hash for json
+	hash := sha1.New()
+	enc := json.NewEncoder(hash) //json encode writes to the hash function
+	enc.Encode(jsonData)
+	return hash.Sum(nil)
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func hashSha1Bytes(hashBytes []byte) []byte {
+
+	//compute sha1 hash of bytes
+	hash := sha1.New()
+	n, err := hash.Write(hashBytes)
+	if n != len(hashBytes) || err != nil {
+		panic(err)
+	}
+	return hash.Sum(nil)
+
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//	generate a hash fnv1a hash. Fast, unique, but insecure! use only for ids and such.
+//  https://programmers.stackexchange.com/questions/49550/which-hashing-algorithm-is-best-for-uniqueness-and-speed
 //
 //////////////////////////////////////////////////////////////////////////
 func generateFnvHashId(hashSeeds ...string) uint32 {
@@ -150,13 +180,75 @@ func generateFnvHashId(hashSeeds ...string) uint32 {
 
 	var randomness int32
 	binary.Read(rand.Reader, binary.LittleEndian, &randomness) //add a little randomness
-	inputString = fmt.Sprintf("%s%d", inputString, randomness)
+	inputString = fmt.Sprintf("%s%x", inputString, randomness)
 
 	h := fnv.New32a()
 	h.Write([]byte(inputString))
-	idHash := h.Sum32()
+	return h.Sum32()
 
-	return idHash
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func generateAuthToken(key string, seeds ...string) string {
+
+	tokenSeed := strings.Join(seeds, "|")
+	hmac := calcHMAC(tokenSeed, key)
+	return base64.URLEncoding.EncodeToString(hmac)
+
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+// verifyToken returns true if messageMAC is a valid HMAC tag for message.
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func verifyToken(key string, authToken string, seeds ...string) bool {
+
+	decodedMac, err := base64.URLEncoding.DecodeString(authToken)
+	if err != nil {
+		panic(err)
+	}
+
+	tokenSeed := strings.Join(seeds, "|")
+
+	return verifyHMAC(tokenSeed, decodedMac, key)
+
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func calcHMAC(message string, key string) []byte {
+
+	mac := hmac.New(sha256.New, []byte(key))
+	n, err := mac.Write([]byte(message))
+	if n != len(message) || err != nil {
+		panic(err)
+	}
+	return mac.Sum(nil)
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func verifyHMAC(message string, macOfMessage []byte, key string) bool {
+
+	mac := hmac.New(sha256.New, []byte(key))
+	mac.Write([]byte(message))
+	expectedMAC := mac.Sum(nil)
+	return hmac.Equal(macOfMessage, expectedMAC)
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -198,7 +290,7 @@ func addDb(c *web.C, h http.Handler) http.Handler {
 //
 //////////////////////////////////////////////////////////////////////////
 func NotFound(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "Umm... have you tried turning it off and on again?", 404)
+	http.Error(w, "Umm... have you tried turning it off and on again?", 404) //TODO: add 404 error message
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -235,7 +327,7 @@ func getDbType(c web.C) (Storer, error) {
 //////////////////////////////////////////////////////////////////////////
 func encodetoDataUri(fileName string, allowTypes ...string) (string, error) {
 
-	file, _ := os.Open(fileName)
+	file, _ := os.Open(fileName) //TODO: change to read in through form or json
 	defer file.Close()
 
 	fileInfo, _ := file.Stat() // FileInfo interface
@@ -307,4 +399,16 @@ func readJson(req *http.Request, jsonData interface{}) {
 	}
 
 	//return nil
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func debugPrintJson(Data interface{}) {
+
+	printJSon := json.NewEncoder(os.Stdout)
+	printJSon.Encode(Data)
 }

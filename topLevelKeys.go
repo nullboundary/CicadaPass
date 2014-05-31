@@ -4,10 +4,23 @@ import (
 	"time"
 )
 
+type registerPass struct {
+	PassTypeId   string `json:"id" gorethink:"id"`                     //Pass type ID
+	SerialNumber string `json:"serialNumber" gorethink:"serialNumber"` //Serial number that uniquely identifies the pass.
+	DeviceLibId  string `json:"deviceLibId" gorethink:"deviceLibId"`   //The device library identifier is a Passbook-specific shared secret between the user’s device and your web server.
+}
+
+type device struct {
+	DeviceLibId string `json:"deviceLibId" gorethink:"deviceLibId"` //The device library identifier is a Passbook-specific shared secret between the user’s device and your web server.
+	PushToken   string `json:"pushToken" gorethink:"pushToken"`     //An APN Push token
+}
+
 type pass struct {
-	Id     string      `json:"id" gorethink:"id"`
-	KeyDoc passKeys    `json:"keyDoc" gorethink:"keyDoc"`
-	Images []passImage `json:"images" gorethink:"images"`
+	Id          string            `json:"id" gorethink:"id"`         //Pass type ID
+	KeyDoc      passKeys          `json:"keyDoc" gorethink:"keyDoc"` //The pass.json file, all the structs used to create it
+	Images      []passImage       `json:"images" gorethink:"images"` //All the images needed for a pass
+	ManifestDoc map[string]string //The manifest.json file, used to verify the content of a pass
+	Updated     time.Time         `json:"updated" gorethink:"updated"` //when the pass was last updated or created
 }
 
 /*************************************************************************

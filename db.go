@@ -34,13 +34,14 @@ type Storer interface {
 
 type DBModder interface {
 	Add(tableName string, data interface{})
+	Merge(tableName string, id string, data interface{}) bool
 	UpdateByID(id string, data interface{})
-	DelByID(id string)
+	DelByID(tableName string, id string)
 }
 
 type DBFinder interface {
 	FindAll(data interface{}, result interface{})
-	FindByID(id string, data interface{}) bool
+	FindByID(tableName string, id string, data interface{}) bool
 }
 
 type DBConner interface {
@@ -117,6 +118,33 @@ func (rt *ReThink) Add(tableName string, data interface{}) {
 //
 //
 //////////////////////////////////////////////////////////////////////////
+func (rt *ReThink) Merge(tableName string, id string, data interface{}) bool {
+
+	log.Println(id)
+	merge := r.Row.Default(r.Expr(map[string]interface{}{"deviceLibId": id})).Merge(data)
+	log.Printf("data:%v", data)
+	response, err := r.Table(tableName).Get(id).Replace(merge).RunWrite(rt.session)
+	if err != nil {
+		log.Printf("Error inserting data: %s", err)
+		return false
+	}
+
+	log.Printf("db-merge:%v", response)
+
+	if response.Unchanged == 1 {
+		return false
+	}
+
+	return true
+
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//
+//
+//
+//////////////////////////////////////////////////////////////////////////
 func (rt *ReThink) FindAll(data interface{}, result interface{}) {
 
 	//result := []beacon{}
@@ -159,10 +187,10 @@ func (rt *ReThink) FindAll(data interface{}, result interface{}) {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func (rt *ReThink) FindByID(id string, data interface{}) bool {
+func (rt *ReThink) FindByID(tableName string, id string, data interface{}) bool {
 
 	log.Printf("db-FindById:%s", id)
-	row, err := r.Table(rt.tableName).
+	row, err := r.Table(tableName).
 		Get(id). //Filter(r.Row.Field("uuid").Eq(id)).
 		RunRow(rt.session)
 
@@ -212,10 +240,10 @@ func (rt *ReThink) UpdateByID(id string, data interface{}) {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func (rt *ReThink) DelByID(id string) {
+func (rt *ReThink) DelByID(tableName string, id string) {
 
 	// Delete the item
-	response, err := r.Table(rt.tableName).Get(id).Delete().RunWrite(rt.session)
+	response, err := r.Table(tableName).Get(id).Delete().RunWrite(rt.session)
 	if err != nil {
 		log.Printf("Error Deleting by ID: %s", err)
 		return

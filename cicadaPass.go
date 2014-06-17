@@ -1,37 +1,26 @@
 package main
 
 import (
-	"archive/zip"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha1"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
-	"encoding/json"
-	"fmt"
 	"github.com/zenazn/goji"
 	"github.com/zenazn/goji/web"
-	"hash/fnv"
-	"io"
+	"log"
 	"net/http"
-	"os"
-	"path"
-	"strings"
+	"strconv"
 	"time"
 )
 
-var tokenPrivateKey string
+var tokenPrivateKey = `y0yArOR5I\)rZT8Kj6NaaJs;{T:h0p1` //TODO: lets make a new key and put this somewhere safer!
+
+var p12pass = "cicada" //TODO: Set in env variables
 
 func main() {
-
-	tokenPrivateKey = `y0yArOR5I\)rZT8Kj6NaaJs;{T:h0p1` //TODO: lets make a new key and put this somewhere safer!
 
 	goji.Post("/pass", createPass)
 	goji.Get("/pass/:version/passes/:passTypeIdentifier", getByPassTypeId)
 	goji.Get("/pass/:version/passes/:passTypeIdentifier/:serialNumber", getLatestByPassTypeId)
 	goji.Post("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier/:serialNumber", registerDevicePass)
-	goji.Get("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier/", getPassSerialbyDevice)
+	goji.Get("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier", getPassSerialbyDevice)
 	goji.Delete("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier/:serialNumber", unregisterDevice)
 	goji.Post("/pass/:version/log", logErrors)
 
@@ -44,64 +33,161 @@ func main() {
 
 //////////////////////////////////////////////////////////////////////////
 //
+//	createPass Handler
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func createPass(c web.C, res http.ResponseWriter, req *http.Request) {
+
+	db, err := getDbType(c)
+	if err != nil {
+		log.Println(err.Error())
+	}
+
+	var newPass pass
+
+	readJson(req, &newPass.KeyDoc) //TODO: create schema to validate data is correct
+
+	uri, err := encodetoDataUri("icon.png", ".png") //TODO: read in images from form, not filesystem
+	check(err)
+	var image passImage
+	image.ImageData = uri
+	image.ImageName = "icon"
+	newPass.Images = append(newPass.Images, image)
+
+	//Unique PassTypeId for the db and the pass file name
+	//idHash := generateFnvHashId(newPass.KeyDoc.Description, time.Now().String())  //generate a hash using pass description + time
+	//newPass.KeyDoc.PassTypeIdentifier
+	//companyName := strings.Replace(newPass.KeyDoc.OrganizationName, " ", "-", -1) //remove spaces from organization name
+	//newPass.Id = fmt.Sprintf("%s-%d", companyName, idHash)                        //set the db id to match the file name
+
+	newPass.Id = newPass.KeyDoc.PassTypeIdentifier //PassTypeID is same as ID in db. PassTypeID should be unique and generated in the auth tool. Should match certificate
+	newPass.Updated = time.Now()                   //set updated to the created time (now)
+
+	db.Add("pass", &newPass)
+
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//	createPass Handler
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func getByPassTypeId(c web.C, res http.ResponseWriter, req *http.Request) {
+
+	log.Println("getByPassTypeId")
+
+	db, err := getDbType(c)
+	check(err)
+
+	//generate a unique serial number for this pass being downloaded
+	//idHash := generateFnvHashId(req.UserAgent(), time.Now().String())
+	//serial := base64.URLEncoding.EncodeToString(idHash) //fmt.Sprintf("%x", idHash)
+	serialHash := hashSha1Bytes([]byte(req.UserAgent() + time.Now().String()))
+	serial := base64.URLEncoding.EncodeToString(serialHash)
+
+	generatePass(c.URLParams["passTypeIdentifier"], serial, res, db)
+
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
 //
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func generatePass(passTypeId string, serialNum string, res http.ResponseWriter, db Storer) {
+func registerDevicePass(c web.C, res http.ResponseWriter, req *http.Request) {
+	db, err := getDbType(c)
+	check(err)
 
-	var dlPass pass
+	var newDevice device         //struct for registering with the device db
+	var newRegister registerPass //struct for the new pass being added to the device
+	var newPass pass             //data of the type of pass being added (used to get updated time tag)
 
-	if !db.FindByID(passTypeId, &dlPass) {
-		http.Error(res, "pass type not found", 404)
+	//POST request to webServiceURL/version/devices/deviceLibraryIdentifier/registrations/passTypeIdentifier/serialNumber
+
+	if !accessToken(req.Header.Get("HTTP_AUTHORIZATION"), c) {
+		http.Error(res, "unauthorized", 401)
 		return
 	}
 
-	dlPass.KeyDoc.SerialNumber = serialNum
+	//2. Store the mapping between the device library identifier and the push token in the devices table.
+	readJson(req, &newDevice)
+	newDevice.DeviceLibId = c.URLParams["deviceLibraryIdentifier"]
 
-	//fmt.Sprintf("%d", dlPass.Updated.Unix())
-	//generate auth token - Don’t change the authentication token in an update.
-	dlPass.KeyDoc.AuthenticationToken = generateAuthToken(tokenPrivateKey, serialNum, passTypeId)
-	//log.Printf("authtoken: ", dlPass.KeyDoc.AuthenticationToken)
+	//3. Store the mapping between the pass (by pass type identifier and serial number) and the device library identifier in the registrations table
+	if !db.FindByID("pass", c.URLParams["passTypeIdentifier"], &newPass) {
+		http.Error(res, "passType not found", 404)
+		return
+	}
 
-	//TODO: save serial + other info to db.
+	newRegister.PassTypeId = c.URLParams["passTypeIdentifier"]
+	newRegister.SerialNumber = c.URLParams["serialNumber"]       //set serial num
+	newRegister.Updated = newPass.Updated                        //set the last updated time for this pass
+	newDevice.PassList = append(newDevice.PassList, newRegister) //add the pass to the device passList
+	if !db.Merge("clientDevices", newDevice.DeviceLibId, newDevice) {
+		res.WriteHeader(http.StatusOK) //If the serial number is already registered for this device, return HTTP status 200.
+		return
+	}
 
-	//make manifestdoc map for storing sha1 hashes
-	dlPass.ManifestDoc = make(map[string]string)
+	res.WriteHeader(http.StatusCreated) //If registration succeeds, return HTTP status 201.
 
-	// Create a new zip archive.
-	res.Header().Set("Content-Type", "application/vnd.apple.pkpass") //sets the extension to pkpass
-	w := zip.NewWriter(res)
-	defer w.Close()
+}
 
-	//add the pass.json file to the zip pass
-	file := addToZipFile(w, "pass.json")
-	enc := json.NewEncoder(file)
-	enc.Encode(dlPass.KeyDoc)
+//////////////////////////////////////////////////////////////////////////
+//
+//
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func getPassSerialbyDevice(c web.C, res http.ResponseWriter, req *http.Request) {
+	//GET request to webServiceURL/version/devices/deviceLibraryIdentifier/registrations/passTypeIdentifier?passesUpdatedSince=tag
+	db, err := getDbType(c)
+	check(err)
 
-	//compute sha1 hash for pass.json
-	dlPass.ManifestDoc["pass.json"] = fmt.Sprintf("%x", hashSha1Json(dlPass.KeyDoc))
+	//4. Respond with this list of serial numbers and the latest update tag in a JSON payload
+	type serialList struct {
+		SerialNumbers []string `json:"serialNumbers"` //list of passes to be updated
+		LastUpdated   int64    `json:"lastUpdated"`   //the time of the most recent pass update
+	}
+	var result serialList
 
-	//add all images to the pass zip
-	for i := range dlPass.Images {
-
-		fileExt, imageBytes := decodetoBytes(dlPass.Images[i].ImageData)
-		fileName := dlPass.Images[i].ImageName + fileExt
-		file = addToZipFile(w, fileName)
-		_, err := file.Write(imageBytes)
+	urlValue := req.URL.Query()
+	var updatedTag int64
+	updatedTagStr := urlValue.Get("passesUpdatedSince")
+	if updatedTagStr != "" {
+		updatedTag, err = strconv.ParseInt(updatedTagStr, 10, 64)
 		check(err)
+	}
+	log.Printf("updated: %d", updatedTag)
 
-		//compute sha1 hash for each image file, add to manifest doc
-		dlPass.ManifestDoc[fileName] = fmt.Sprintf("%x", hashSha1Bytes(imageBytes))
+	var userDevice device
+
+	dLId := c.URLParams["deviceLibraryIdentifier"]
+
+	//1. Look at the registrations table and determine which passes the device is registered for.
+	if !db.FindByID("clientDevices", dLId, &userDevice) {
+		http.Error(res, "device not found", 404)
+		return
 	}
 
-	//add the manifest.json file to the zip pass
-	file = addToZipFile(w, "manifest.json")
-	enc = json.NewEncoder(file)
-	enc.Encode(dlPass.ManifestDoc)
-	debugPrintJson(dlPass.ManifestDoc)
+	passList := userDevice.PassList
 
-	//TODO: sign pass
+	for i := range passList { //TODO: Could this be sorted on the db?
+		//2. Look at the passes table and determine which passes have changed since the given tag. Don’t include serial numbers of passes that the device didn’t register for.
+		if passList[i].Updated.Unix() >= updatedTag {
+			result.SerialNumbers = append(result.SerialNumbers, passList[i].SerialNumber)
+
+			//3. Compare the update tags for each pass that has changed and determine which one is the latest.
+			if passList[i].Updated.Unix() >= result.LastUpdated {
+				result.LastUpdated = passList[i].Updated.Unix()
+
+			}
+		}
+	}
+
+	writeJson(res, result)
 
 }
 
@@ -111,113 +197,20 @@ func generatePass(passTypeId string, serialNum string, res http.ResponseWriter, 
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func check(e error) {
-	if e != nil {
-		panic(e)
-	}
-}
+func getLatestByPassTypeId(c web.C, res http.ResponseWriter, req *http.Request) {
+	//GET request to webServiceURL/version/passes/passTypeIdentifier/serialNumber
 
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func addToZipFile(zWrite *zip.Writer, fileName string) io.Writer {
+	//TODO: Support standard HTTP caching on this endpoint: check for the If-Modified-Since header and return HTTP status code 304 if the pass has not changed.
 
-	var header zip.FileHeader
-	header.Name = fileName
-	header.SetModTime(time.Now().UTC())
-	file, err := zWrite.CreateHeader(&header)
+	db, err := getDbType(c)
 	check(err)
 
-	return file
-
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func hashSha1Json(jsonData interface{}) []byte {
-
-	//compute sha1 hash for json
-	hash := sha1.New()
-	enc := json.NewEncoder(hash) //json encode writes to the hash function
-	enc.Encode(jsonData)
-	return hash.Sum(nil)
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func hashSha1Bytes(hashBytes []byte) []byte {
-
-	//compute sha1 hash of bytes
-	hash := sha1.New()
-	n, err := hash.Write(hashBytes)
-	if n != len(hashBytes) || err != nil {
-		panic(err)
-	}
-	return hash.Sum(nil)
-
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//	generate a hash fnv1a hash. Fast, unique, but insecure! use only for ids and such.
-//  https://programmers.stackexchange.com/questions/49550/which-hashing-algorithm-is-best-for-uniqueness-and-speed
-//
-//////////////////////////////////////////////////////////////////////////
-func generateFnvHashId(hashSeeds ...string) uint32 {
-
-	inputString := strings.Join(hashSeeds, "")
-
-	var randomness int32
-	binary.Read(rand.Reader, binary.LittleEndian, &randomness) //add a little randomness
-	inputString = fmt.Sprintf("%s%x", inputString, randomness)
-
-	h := fnv.New32a()
-	h.Write([]byte(inputString))
-	return h.Sum32()
-
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func generateAuthToken(key string, seeds ...string) string {
-
-	tokenSeed := strings.Join(seeds, "|")
-	hmac := calcHMAC(tokenSeed, key)
-	return base64.URLEncoding.EncodeToString(hmac)
-
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-// verifyToken returns true if messageMAC is a valid HMAC tag for message.
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func verifyToken(key string, authToken string, seeds ...string) bool {
-
-	decodedMac, err := base64.URLEncoding.DecodeString(authToken)
-	if err != nil {
-		panic(err)
+	if !accessToken(req.Header.Get("HTTP_AUTHORIZATION"), c) {
+		http.Error(res, "unauthorized", 401)
+		return
 	}
 
-	tokenSeed := strings.Join(seeds, "|")
-
-	return verifyHMAC(tokenSeed, decodedMac, key)
+	generatePass(c.URLParams["passTypeIdentifier"], c.URLParams["serialNumber"], res, db)
 
 }
 
@@ -227,178 +220,24 @@ func verifyToken(key string, authToken string, seeds ...string) bool {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func calcHMAC(message string, key string) []byte {
+func unregisterDevice(c web.C, res http.ResponseWriter, req *http.Request) {
+	//DELETE request to webServiceURL/version/devices/deviceLibraryIdentifier/registrations/passTypeIdentifier/serialNumber
 
-	mac := hmac.New(sha256.New, []byte(key))
-	n, err := mac.Write([]byte(message))
-	if n != len(message) || err != nil {
-		panic(err)
-	}
-	return mac.Sum(nil)
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func verifyHMAC(message string, macOfMessage []byte, key string) bool {
-
-	mac := hmac.New(sha256.New, []byte(key))
-	mac.Write([]byte(message))
-	expectedMAC := mac.Sum(nil)
-	return hmac.Equal(macOfMessage, expectedMAC)
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//	addDb Middleware
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func addDb(c *web.C, h http.Handler) http.Handler {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-
-		if c.Env == nil {
-			c.Env = make(map[string]interface{})
-		}
-
-		if _, ok := c.Env["db"]; !ok { //test is the db is already added
-
-			rt := NewReThink()
-			rt.url = "127.0.0.1"
-			rt.port = "28015"
-			rt.dbName = "test"
-			rt.tableName = "pass"
-
-			s := Storer(rt) //abstract cb to a Storer
-			s.Conn()
-
-			c.Env["db"] = s //add db
-		}
-
-		h.ServeHTTP(w, r)
-	}
-	return http.HandlerFunc(handler)
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-// NotFound is a 404 handler.
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func NotFound(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "Umm... have you tried turning it off and on again?", 404) //TODO: add 404 error message
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//	getDbType
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func getDbType(c web.C) (Storer, error) {
-
-	if v, ok := c.Env["db"]; ok {
-
-		if db, ok := v.(Storer); ok {
-
-			return db, nil //all good
-
-		} else {
-			err := fmt.Errorf("value could not convert to type Storer")
-			return nil, err
-		}
-
-	} else {
-		err := fmt.Errorf("value for key db, not found")
-		return nil, err
-	}
-
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-// encodetoDataUri
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func encodetoDataUri(fileName string, allowTypes ...string) (string, error) {
-
-	file, _ := os.Open(fileName) //TODO: change to read in through form or json
-	defer file.Close()
-
-	fileInfo, _ := file.Stat() // FileInfo interface
-	size := fileInfo.Size()    // file size
-
-	data := make([]byte, size)
-
-	contentType := path.Ext(fileName)
-
-	typeFound := false
-	for _, fileType := range allowTypes { //match the type with the allowed types
-		if contentType == fileType {
-			typeFound = true
-			break
-		}
-	}
-
-	if !typeFound {
-		err := fmt.Errorf("file type: %s not allowed", contentType)
-		return "", err
-	}
-
-	file.Read(data)
-
-	return fmt.Sprintf("data:%s;base64,%s", contentType, base64.StdEncoding.EncodeToString(data)), nil
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-// decodetoBytes
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func decodetoBytes(str string) (string, []byte) {
-
-	dataStr := strings.SplitN(str, ",", 2) //seperate data:png;base64, from the DataURI
-
-	dataType := strings.Trim(dataStr[0], "data:;base64") //extract only the file type
-
-	data, err := base64.StdEncoding.DecodeString(dataStr[1]) // [] byte
+	db, err := getDbType(c)
 	check(err)
 
-	return dataType, data
-
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-// Encodes data into a 'data:' URI specified at
-// https://developer.mozilla.org/en/data_URIs.
-//
-//////////////////////////////////////////////////////////////////////////
-func dataUrl(data []byte, contentType string) string {
-	return fmt.Sprintf("data:%s;base64,%s",
-		contentType, base64.StdEncoding.EncodeToString(data))
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func readJson(req *http.Request, jsonData interface{}) {
-
-	if err := json.NewDecoder(req.Body).Decode(&jsonData); err != nil {
-		fmt.Printf("jsonRead Error:%v", err)
-		//return &serverError{err, "400 Bad Request", http.StatusBadRequest} //TODO: return error encoded as json?
+	if !accessToken(req.Header.Get("HTTP_AUTHORIZATION"), c) {
+		http.Error(res, "unauthorized", 401)
+		return
 	}
 
-	//return nil
+	var newRegister registerPass
+
+	newRegister.PassTypeId = c.URLParams["passTypeIdentifier"]
+	newRegister.SerialNumber = c.URLParams["serialNumber"]
+	//newRegister.DeviceLibId = newDevice.DeviceLibId
+	//db.Add("clientRegister", newRegister)
+	db.DelByID("clientDevices", c.URLParams["deviceLibraryIdentifier"]) //Delete the serial and/or pasTypeID from the device listing. (delete device if contains no serials?)
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -407,8 +246,16 @@ func readJson(req *http.Request, jsonData interface{}) {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func debugPrintJson(Data interface{}) {
+func logErrors(c web.C, res http.ResponseWriter, req *http.Request) {
+	//POST webServiceURL/version/log
 
-	printJSon := json.NewEncoder(os.Stdout)
-	printJSon.Encode(Data)
+	type errorLog struct {
+		message string `json:"error"`
+	}
+	var printErr errorLog
+
+	readJson(req, &printErr) //read in the error
+
+	log.Printf("error Message: %s", printErr.message) //log it
+
 }

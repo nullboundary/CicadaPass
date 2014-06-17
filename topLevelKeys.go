@@ -5,22 +5,23 @@ import (
 )
 
 type registerPass struct {
-	PassTypeId   string `json:"id" gorethink:"id"`                     //Pass type ID
-	SerialNumber string `json:"serialNumber" gorethink:"serialNumber"` //Serial number that uniquely identifies the pass.
-	DeviceLibId  string `json:"deviceLibId" gorethink:"deviceLibId"`   //The device library identifier is a Passbook-specific shared secret between the user’s device and your web server.
+	PassTypeId   string    `json:"id" gorethink:"id"`                     //Pass type ID
+	SerialNumber string    `json:"serialNumber" gorethink:"serialNumber"` //Serial number that uniquely identifies the pass.
+	Updated      time.Time `json:"updated" gorethink:"updated"`           //when the pass was last updated or created
 }
 
 type device struct {
-	DeviceLibId string `json:"deviceLibId" gorethink:"deviceLibId"` //The device library identifier is a Passbook-specific shared secret between the user’s device and your web server.
-	PushToken   string `json:"pushToken" gorethink:"pushToken"`     //An APN Push token
+	DeviceLibId string         `json:"deviceLibId" gorethink:"deviceLibId"` //The device library identifier is a Passbook-specific shared secret between the user’s device and your web server.
+	PushToken   string         `json:"pushToken" gorethink:"pushToken"`     //An APN Push token
+	PassList    []registerPass `json:"passList" gorethink:"passList"`       //a list of passes that this device has
 }
 
 type pass struct {
-	Id          string            `json:"id" gorethink:"id"`         //Pass type ID
-	KeyDoc      passKeys          `json:"keyDoc" gorethink:"keyDoc"` //The pass.json file, all the structs used to create it
-	Images      []passImage       `json:"images" gorethink:"images"` //All the images needed for a pass
-	ManifestDoc map[string]string //The manifest.json file, used to verify the content of a pass
-	Updated     time.Time         `json:"updated" gorethink:"updated"` //when the pass was last updated or created
+	Id          string            `json:"id" gorethink:"id"`             //Pass type ID
+	KeyDoc      passKeys          `json:"keyDoc" gorethink:"keyDoc"`     //The pass.json file, all the structs used to create it
+	Images      []passImage       `json:"images" gorethink:"images"`     //All the images needed for a pass
+	ManifestDoc map[string]string `json:"manifest" gorethink:"manifest"` //The manifest.json file, used to verify the content of a pass
+	Updated     time.Time         `json:"updated" gorethink:"updated"`   //when the pass was last updated or created
 }
 
 /*************************************************************************
@@ -28,20 +29,6 @@ type pass struct {
 
 
 ************************************************************************/
-/*
-type passImages struct {
-	Icon        string `json:"icon,omitempty" gorethink:"icon,omitempty"`
-	Icon2x      string `json:"icon2x,omitempty" gorethink:"icon2x,omitempty"`
-	Thumbnail   string `json:"thumbnail,omitempty" gorethink:"thumbnail,omitempty"`
-	Thumbnail2x string `json:"thumbnail2x,omitempty" gorethink:"thumbnail2x,omitempty"`
-	Logo        string `json:"logo,omitempty" gorethink:"logo,omitempty"`
-	Logo2x      string `json:"logo2x,omitempty" gorethink:"logo2x,omitempty"`
-	Footer      string `json:"footer,omitempty" gorethink:"footer,omitempty"`
-	Strip       string `json:"strip,omitempty" gorethink:"strip,omitempty"`
-	Background  string `json:"background,omitempty" gorethink:"background,omitempty"`
-}
-*/
-
 type passImage struct {
 	ImageData string `json:"image,omitempty" gorethink:"image,omitempty"`
 	ImageName string `json:"name,omitempty" gorethink:"name,omitempty"`

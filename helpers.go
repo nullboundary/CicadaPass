@@ -2,23 +2,26 @@ package main
 
 import (
 	"archive/zip"
-	"bitbucket.org/passNinja/opensslSign"
-	"crypto/hmac"
+	"bitbucket.org/cicadaDev/gocertsigner"
+	"bitbucket.org/cicadaDev/storer"
+	"bitbucket.org/cicadaDev/utils"
 	"crypto/rand"
 	"crypto/sha1"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"github.com/slugmobile/govalidator"
 	"github.com/zenazn/goji/web"
 	"hash/fnv"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"path"
 	"strings"
 	"time"
+	"unicode"
 )
 
 //////////////////////////////////////////////////////////////////////////
@@ -27,48 +30,76 @@ import (
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func generatePass(passTypeId string, serialNum string, res http.ResponseWriter, db Storer) {
+func generatePass(passId string, serialNum string, res http.ResponseWriter, db storer.Storer) {
 
 	var dlPass pass
 
-	if !db.FindByID("pass", passTypeId, &dlPass) {
-		http.Error(res, "pass type not found", 404)
+	//search for the pass by ID in the db
+	if db.FindByIdx("passMutate", "filename", passId, &dlPass) {
+		log.Printf("[DEBUG] found pass: %s in passMutate table", passId)
+		db.DelById("passMutate", passId) //TODO: should be removed ONLY after pass is registered in device.
+	} else if db.FindByIdx("pass", "filename", passId, &dlPass) {
+		log.Printf("[DEBUG] found pass: %s in pass table", passId)
+	} else {
+		log.Printf("[WARN] pass: %s not found", passId)
+		http.Error(res, "pass not found", 404)
 		return
 	}
 
+	//update pass doc
 	dlPass.KeyDoc.SerialNumber = serialNum
+	dlPass.KeyDoc.PassTypeIdentifier = "pass.ninja.pass.storecard" //set via etcd?
+	dlPass.KeyDoc.TeamIdentifier = "F8QZ9HX5A6"                    //set via etcd
+	dlPass.KeyDoc.FormatVersion = 1
+	dlPass.KeyDoc.WebServiceURL = webServiceURL
+	dlPass.KeyDoc.AuthenticationToken = utils.GenerateToken(tokenPrivateKey, serialNum, passId)
 
-	//fmt.Sprintf("%d", dlPass.Updated.Unix())
-	//generate auth token - Don’t change the authentication token in an update.
-	dlPass.KeyDoc.AuthenticationToken = generateAuthToken(tokenPrivateKey, serialNum, passTypeId)
-	//log.Printf("authtoken: ", dlPass.KeyDoc.AuthenticationToken)
+	//log pass download info: time, pass id, serialnum, user id.
+	var dlLog downloadLog
+	dlLog.Id = dlPass.Id
+	dlLog.PassType = dlPass.KeyDoc.PassTypeIdentifier
+	dlLog.UserId = dlPass.UserId
+	dlLog.Downloaded = time.Now()
 
-	//TODO: save serial + other info to db.
+	if !db.Add("downloadLog", dlLog) {
+		log.Printf("[ERROR] error adding pass download record: %s to db", dlLog.Id)
+		return
+	}
 
 	//make manifestdoc map for storing sha1 hashes
 	dlPass.ManifestDoc = make(map[string]string)
 
+	//validate the struct before generating a pass
+	_, err := govalidator.ValidateStruct(dlPass)
+	if err != nil {
+		utils.Check(err)
+		http.Error(res, "malformed pass data, cannot build pass", http.StatusInternalServerError)
+		return
+	}
+
 	// Create a new zip archive.
 	res.Header().Set("Content-Type", "application/vnd.apple.pkpass") //sets the extension to pkpass
+	//Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", filename))
 	w := zip.NewWriter(res)
 	defer w.Close()
 
 	//add the pass.json file to the zip pass
 	file := addToZipFile(w, "pass.json")
-	enc := json.NewEncoder(file)
-	enc.Encode(dlPass.KeyDoc)
+	keyDocBytes, err := json.MarshalIndent(dlPass.KeyDoc, "", "  ") //pretty print json doc
+	utils.Check(err)
+	file.Write(keyDocBytes)
 
 	//compute sha1 hash for pass.json
-	dlPass.ManifestDoc["pass.json"] = fmt.Sprintf("%x", hashSha1Json(dlPass.KeyDoc))
+	dlPass.ManifestDoc["pass.json"] = fmt.Sprintf("%x", hashSha1Bytes(keyDocBytes))
 
 	//add all images to the pass zip
 	for i := range dlPass.Images {
 
-		fileExt, imageBytes := decodetoBytes(dlPass.Images[i].ImageData)
-		fileName := dlPass.Images[i].ImageName + fileExt
+		fileExt, imageBytes := decodetoBytes(dlPass.Images[i].ImageData, "png")
+		fileName := dlPass.Images[i].ImageName + "." + fileExt
 		file = addToZipFile(w, fileName)
 		_, err := file.Write(imageBytes)
-		check(err)
+		utils.Check(err)
 
 		//compute sha1 hash for each image file, add to manifest doc
 		dlPass.ManifestDoc[fileName] = fmt.Sprintf("%x", hashSha1Bytes(imageBytes))
@@ -76,35 +107,22 @@ func generatePass(passTypeId string, serialNum string, res http.ResponseWriter, 
 
 	//add the manifest.json file to the zip pass
 	file = addToZipFile(w, "manifest.json")
-	enc = json.NewEncoder(file)
-	enc.Encode(dlPass.ManifestDoc)
-	debugPrintJson(dlPass.ManifestDoc)
-
 	//read in certificates and manifest as bytes
-	manifestBytes, err := json.Marshal(dlPass.ManifestDoc)
-	//get documents and stuff from db or other
-	p12 := opensslSign.FileToBytes("testCert.p12")
-	caCert := opensslSign.FileToBytes("wwdr.cer")
+	manifestBytes, err := json.MarshalIndent(dlPass.ManifestDoc, "", "  ")
+	utils.Check(err)
+	file.Write(manifestBytes)
 
-	signature, err := opensslSign.SignDocument(manifestBytes, p12, p12pass, caCert) //sign it!
-	check(err)
+	//TODO: get documents and stuff from db or etcd
+	pemKey := goCertSigner.FileToBytes("passCerts/pass.ninja.storecard.key.pem")
+	x509cert := goCertSigner.FileToBytes("passCerts/pass.ninja.storecard.cer")
+	caCert := goCertSigner.FileToBytes("passCerts/AppleWWDRCA.cer")
+	signature, err := goCertSigner.SignWithX509PEM(manifestBytes, x509cert, pemKey, p12pass, caCert)
+	utils.Check(err)
 
 	file = addToZipFile(w, "signature")
 	_, err = file.Write(signature)
-	check(err)
+	utils.Check(err)
 
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func check(e error) {
-	if e != nil {
-		panic(e)
-	}
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -117,9 +135,11 @@ func addToZipFile(zWrite *zip.Writer, fileName string) io.Writer {
 
 	var header zip.FileHeader
 	header.Name = fileName
-	header.SetModTime(time.Now().UTC())
+	header.Method = zip.Deflate         //compression method
+	header.SetModTime(time.Now().UTC()) //sets modify and create times
+	header.SetMode(0644)                //set all files to -rw-r--r--
 	file, err := zWrite.CreateHeader(&header)
-	check(err)
+	utils.Check(err)
 
 	return file
 
@@ -184,37 +204,6 @@ func generateFnvHashId(hashSeeds ...string) uint32 {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func generateAuthToken(key string, seeds ...string) string {
-
-	tokenSeed := strings.Join(seeds, "|")
-	hmac := calcHMAC(tokenSeed, key)
-	return base64.URLEncoding.EncodeToString(hmac)
-
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-// verifyToken returns true if messageMAC is a valid HMAC tag for message.
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func verifyToken(key string, authToken string, seeds ...string) bool {
-
-	decodedMac, err := base64.URLEncoding.DecodeString(authToken)
-	if err != nil {
-		panic(err)
-	}
-	tokenSeed := strings.Join(seeds, "|")
-	return verifyHMAC(tokenSeed, decodedMac, key)
-
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
 func accessToken(authString string, c web.C) bool {
 
 	//1. Verify that the authentication token is correct.
@@ -223,76 +212,16 @@ func accessToken(authString string, c web.C) bool {
 		return false //header is malformed
 	}
 	authToken := header[1] //take the second value "applePass token"
-	if !verifyToken(tokenPrivateKey, authToken, c.URLParams["serialNumber"], c.URLParams["passTypeIdentifier"]) {
-		return false
+	if ok, err := utils.VerifyToken(tokenPrivateKey, authToken, c.URLParams["serialNumber"], c.URLParams["passTypeIdentifier"]); !ok {
+
+		if err != nil {
+			utils.Check(err)
+		}
+		return false //verify failed
 	}
+
 	return true
 
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func calcHMAC(message string, key string) []byte {
-
-	mac := hmac.New(sha256.New, []byte(key))
-	n, err := mac.Write([]byte(message))
-	if n != len(message) || err != nil {
-		panic(err)
-	}
-	return mac.Sum(nil)
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func verifyHMAC(message string, macOfMessage []byte, key string) bool {
-
-	mac := hmac.New(sha256.New, []byte(key))
-	n, err := mac.Write([]byte(message))
-	if n != len(message) || err != nil {
-		panic(err)
-	}
-	expectedMAC := mac.Sum(nil)
-	return hmac.Equal(macOfMessage, expectedMAC)
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//	addDb Middleware
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func addDb(c *web.C, h http.Handler) http.Handler {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-
-		if c.Env == nil {
-			c.Env = make(map[string]interface{})
-		}
-
-		if _, ok := c.Env["db"]; !ok { //test is the db is already added
-
-			rt := NewReThink()
-			rt.url = "127.0.0.1"
-			rt.port = "28015"
-			rt.dbName = "test"
-			rt.tableName = "pass"
-
-			s := Storer(rt) //abstract cb to a Storer
-			s.Conn()
-
-			c.Env["db"] = s //add db
-		}
-
-		h.ServeHTTP(w, r)
-	}
-	return http.HandlerFunc(handler)
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -302,33 +231,7 @@ func addDb(c *web.C, h http.Handler) http.Handler {
 //
 //////////////////////////////////////////////////////////////////////////
 func NotFound(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "Umm... have you tried turning it off and on again?", 404) //TODO: add 404 error message
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//	getDbType
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func getDbType(c web.C) (Storer, error) {
-
-	if v, ok := c.Env["db"]; ok {
-
-		if db, ok := v.(Storer); ok {
-
-			return db, nil //all good
-
-		} else {
-			err := fmt.Errorf("value could not convert to type Storer")
-			return nil, err
-		}
-
-	} else {
-		err := fmt.Errorf("value for key db, not found")
-		return nil, err
-	}
-
+	http.Error(w, "Resource Not Found", 404) //TODO: add 404 error message
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -337,7 +240,7 @@ func getDbType(c web.C) (Storer, error) {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func encodetoDataUri(fileName string, allowTypes ...string) (string, error) {
+func encodetoDataUri(fileName string, mimeType string, allowTypes ...string) (string, error) {
 
 	file, _ := os.Open(fileName) //TODO: change to read in through form or json
 	defer file.Close()
@@ -358,13 +261,13 @@ func encodetoDataUri(fileName string, allowTypes ...string) (string, error) {
 	}
 
 	if !typeFound {
-		err := fmt.Errorf("file type: %s not allowed", contentType)
+		err := fmt.Errorf("[Error] file type: %s not allowed", contentType)
 		return "", err
 	}
 
 	file.Read(data)
 
-	return fmt.Sprintf("data:%s;base64,%s", contentType, base64.StdEncoding.EncodeToString(data)), nil
+	return fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(data)), nil
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -373,16 +276,25 @@ func encodetoDataUri(fileName string, allowTypes ...string) (string, error) {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func decodetoBytes(str string) (string, []byte) {
+func decodetoBytes(str string, fileType string) (string, []byte) {
 
-	dataStr := strings.SplitN(str, ",", 2) //seperate data:png;base64, from the DataURI
+	dataStr := strings.SplitN(str, ",", 2) //seperate data:image/png;base64, from the DataURI
 
-	dataType := strings.Trim(dataStr[0], "data:;base64") //extract only the file type
+	fieldTest := func(c rune) bool {
+		return !unicode.IsLetter(c) && !unicode.IsNumber(c)
+	}
+	fields := strings.FieldsFunc(dataStr[0], fieldTest) //Fields are: ["data" "image" "png" "base64"]
+	dataExt := fields[2]                                //only need the file extension
+
+	if dataExt != fileType {
+		err := fmt.Errorf("[Error] file type: %s not allowed", dataExt)
+		utils.Check(err)
+	}
 
 	data, err := base64.StdEncoding.DecodeString(dataStr[1]) // [] byte
-	check(err)
+	utils.Check(err)
 
-	return dataType, data
+	return dataExt, data
 
 }
 
@@ -403,14 +315,58 @@ func dataUrl(data []byte, contentType string) string {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func readJson(req *http.Request, jsonData interface{}) {
+func addValidators() {
 
-	if err := json.NewDecoder(req.Body).Decode(&jsonData); err != nil {
-		fmt.Printf("jsonRead Error:%v", err)
-		//return &serverError{err, "400 Bad Request", http.StatusBadRequest} //TODO: return error encoded as json?
-	}
+	//check barcode format is 1 of 3 types
+	barcodeFormats := []string{"PKBarcodeFormatQR", "PKBarcodeFormatPDF417", "PKBarcodeFormatAztec"}
+	addListValidator("barcode", barcodeFormats)
 
-	//return nil
+	//check transit type
+	transitTypes := []string{"PKTransitTypeAir", "PKTransitTypeBoat", "PKTransitTypeBus", "PKTransitTypeGeneric", "PKTransitTypeTrain"}
+	addListValidator("transit", transitTypes)
+
+	//check datestyle type (timestyle and date style are the same list)
+	timeTypes := []string{"PKDateStyleNone", "PKDateStyleShort", "PKDateStyleMedium", "PKDateStyleLong", "PKDateStyleFull"}
+	addListValidator("datestyle", timeTypes)
+
+	//check numstyle type
+	numTypes := []string{"PKNumberStyleDecimal", "PKNumberStylePercent", "PKNumberStyleScientific", "PKNumberStyleSpellOut"}
+	addListValidator("numstyle", numTypes)
+
+	//check text align style types
+	textAlignTypes := []string{"PKTextAlignmentLeft", "PKTextAlignmentCenter", "PKTextAlignmentRight", "PKTextAlignmentNatural"}
+	addListValidator("align", textAlignTypes)
+
+	//check to make sure its a valid currency code: USD,GBP etc
+	govalidator.TagMap["iso4217"] = govalidator.Validator(func(str string) bool {
+
+		if len(str) != 3 {
+			return false
+		}
+		if !govalidator.IsUpperCase(str) {
+			return false
+		}
+		return govalidator.IsAlpha(str)
+
+	})
+
+	//check to make sure its a valid png image datauri
+	govalidator.TagMap["imagepng"] = govalidator.Validator(func(str string) bool {
+
+		dataStr := strings.SplitN(str, ",", 2) //seperate data:image/png;base64, from the DataURI
+
+		if !strings.Contains(dataStr[0], "image") {
+			return false
+		}
+
+		if !strings.Contains(dataStr[0], "png") {
+			return false
+		}
+
+		return govalidator.IsDataURI(str)
+
+	})
+
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -419,25 +375,74 @@ func readJson(req *http.Request, jsonData interface{}) {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func writeJson(res http.ResponseWriter, dataOut interface{}) {
+func addListValidator(key string, typeList []string) {
 
-	//TODO: Implement pretty printing. //err = json.MarshalIndent(result, "", "  ")
+	govalidator.TagMap[key] = govalidator.Validator(func(str string) bool {
+		for _, nextType := range typeList {
+			if str == nextType {
+				return true
+			}
+		}
+		return false
+	})
 
-	if err := json.NewEncoder(res).Encode(dataOut); err != nil { //encode the result struct to json and output on response writer
-		//return &serverError{err, "500 Internal Server Error", http.StatusInternalServerError}
-	}
-
-	//return nil
 }
 
 //////////////////////////////////////////////////////////////////////////
 //
-//
+//	addDb Middleware
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func debugPrintJson(Data interface{}) {
+func AddDb(c *web.C, h http.Handler) http.Handler {
+	handler := func(w http.ResponseWriter, r *http.Request) {
 
-	printJSon := json.NewEncoder(os.Stdout)
-	printJSon.Encode(Data)
+		if c.Env == nil {
+			c.Env = make(map[interface{}]interface{})
+		}
+
+		if _, ok := c.Env["db"]; !ok { //test is the db is already added
+
+			rt := storer.NewReThink()
+			var err error
+			rt.Url, err = utils.GetEtcdKey("db/url") //os.Getenv("PASS_APP_DB_URL")
+			utils.Check(err)
+			rt.Port, err = utils.GetEtcdKey("db/port") //os.Getenv("PASS_APP_DB_PORT")
+			utils.Check(err)
+			rt.DbName, err = utils.GetEtcdKey("db/name") //os.Getenv("PASS_APP_DB_NAME")
+			utils.Check(err)
+
+			s := storer.Storer(rt) //abstract cb to a Storer
+			s.Conn()
+
+			c.Env["db"] = s //add db
+		}
+
+		h.ServeHTTP(w, r)
+	}
+	return http.HandlerFunc(handler)
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//	getDbType
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func GetDbType(c web.C) (storer.Storer, error) {
+
+	if v, ok := c.Env["db"]; ok {
+
+		if db, ok := v.(storer.Storer); ok {
+
+			return db, nil //all good
+
+		}
+		err := fmt.Errorf("value could not convert to type Storer")
+		return nil, err
+
+	}
+	err := fmt.Errorf("value for key db, not found")
+	return nil, err
+
 }

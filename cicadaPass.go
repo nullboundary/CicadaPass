@@ -1,85 +1,104 @@
 package main
 
 import (
+	"bitbucket.org/cicadaDev/utils"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
-	"github.com/zenazn/goji"
+	"github.com/hashicorp/logutils"
+	"github.com/zenazn/goji/graceful"
 	"github.com/zenazn/goji/web"
+	"io/ioutil"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 )
 
-var tokenPrivateKey = `y0yArOR5I\)rZT8Kj6NaaJs;{T:h0p1` //TODO: lets make a new key and put this somewhere safer!
-
+var tokenPrivateKey = []byte(`y0yArOR5I\)rZT8Kj6NaaJs;{T:h0p1`) //TODO: lets make a new key and put this somewhere safer!
+var webServiceURL = "https://local.pass.ninja:8001"
 var p12pass = "cicada" //TODO: Set in env variables
+
+type downloadLog struct {
+	Id         string    `json:"passid" gorethink:"passid" valid:"required"`                          //Pass ID - used for updating, but not sharing
+	UserId     string    `json:"-" gorethink:"userid,omitempty"`                                      //The Id of the pass creator
+	PassType   string    `json:"passtype,omitempty" gorethink:"passtype,omitempty" valid:"passtypes"` //The pass type, boardingpass, coupon, etc.
+	Downloaded time.Time `json:"downloaded" gorethink:"downloaded" valid:"required"`                  //when the pass was downloaded
+}
+
+func init() {
+	//add custom validator functions
+	addValidators()
+
+	//setup logutils log levels
+	filter := &logutils.LevelFilter{
+		Levels:   []logutils.LogLevel{"DEBUG", "WARN", "ERROR"},
+		MinLevel: "DEBUG",
+		Writer:   os.Stderr,
+	}
+	log.SetOutput(filter)
+
+}
 
 func main() {
 
-	goji.Post("/pass", createPass)
-	goji.Get("/pass/:version/passes/:passTypeIdentifier", getByPassTypeId)
-	goji.Get("/pass/:version/passes/:passTypeIdentifier/:serialNumber", getLatestByPassTypeId)
-	goji.Post("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier/:serialNumber", registerDevicePass)
-	goji.Get("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier", getPassSerialbyDevice)
-	goji.Delete("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier/:serialNumber", unregisterDevice)
-	goji.Post("/pass/:version/log", logErrors)
+	mux := web.New()
 
-	goji.NotFound(NotFound)
+	mux.Get("/pass/:version/passes/:passTypeIdentifier", getByPassTypeId) //TODO: maybe :version should be regex?
+	mux.Get("/pass/:version/passes/:passTypeIdentifier/:serialNumber", getLatestByPassTypeId)
+	mux.Post("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier/:serialNumber", registerDevicePass)
+	mux.Get("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier", getPassSerialbyDevice)
+	mux.Delete("/pass/:version/devices/:deviceLibraryIdentifier/registrations/:passTypeIdentifier/:serialNumber", unregisterDevice)
+	mux.Post("/pass/:version/log", logErrors)
 
-	goji.Use(addDb)
+	mux.NotFound(NotFound)
 
-	goji.Serve()
+	mux.Use(AddDb)
+
+	//customCA Server is only used for testing
+	customCAServer := &graceful.Server{Addr: ":10443", Handler: mux}
+	customCAServer.TLSConfig = addRootCA("tls/myCA.cer")
+	customCAServer.ListenAndServeTLS("tls/mycert1.cer", "tls/mycert1.key")
+
+	//graceful.ListenAndServeTLS(":10443", "tls/mycert1.cer", "tls/mycert1.key", mux)
 }
 
 //////////////////////////////////////////////////////////////////////////
 //
-//	createPass Handler
+//
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func createPass(c web.C, res http.ResponseWriter, req *http.Request) {
+func addRootCA(filepath string) *tls.Config {
 
-	db, err := getDbType(c)
-	if err != nil {
-		log.Println(err.Error())
+	severCert, err := ioutil.ReadFile(filepath)
+	utils.Check(err)
+
+	cAPool := x509.NewCertPool()
+	cAPool.AppendCertsFromPEM(severCert)
+
+	tlc := &tls.Config{
+		RootCAs:    cAPool,
+		MinVersion: tls.VersionTLS10,
 	}
 
-	var newPass pass
-
-	readJson(req, &newPass.KeyDoc) //TODO: create schema to validate data is correct
-
-	uri, err := encodetoDataUri("icon.png", ".png") //TODO: read in images from form, not filesystem
-	check(err)
-	var image passImage
-	image.ImageData = uri
-	image.ImageName = "icon"
-	newPass.Images = append(newPass.Images, image)
-
-	//Unique PassTypeId for the db and the pass file name
-	//idHash := generateFnvHashId(newPass.KeyDoc.Description, time.Now().String())  //generate a hash using pass description + time
-	//newPass.KeyDoc.PassTypeIdentifier
-	//companyName := strings.Replace(newPass.KeyDoc.OrganizationName, " ", "-", -1) //remove spaces from organization name
-	//newPass.Id = fmt.Sprintf("%s-%d", companyName, idHash)                        //set the db id to match the file name
-
-	newPass.Id = newPass.KeyDoc.PassTypeIdentifier //PassTypeID is same as ID in db. PassTypeID should be unique and generated in the auth tool. Should match certificate
-	newPass.Updated = time.Now()                   //set updated to the created time (now)
-
-	db.Add("pass", &newPass)
+	return tlc
 
 }
 
 //////////////////////////////////////////////////////////////////////////
 //
-//	createPass Handler
+//	getByPassTypeId Handler
 //
 //
 //////////////////////////////////////////////////////////////////////////
 func getByPassTypeId(c web.C, res http.ResponseWriter, req *http.Request) {
 
-	log.Println("getByPassTypeId")
+	log.Println("[DEBUG] getByPassTypeId")
 
-	db, err := getDbType(c)
-	check(err)
+	db, err := GetDbType(c)
+	utils.Check(err)
 
 	//generate a unique serial number for this pass being downloaded
 	//idHash := generateFnvHashId(req.UserAgent(), time.Now().String())
@@ -98,26 +117,30 @@ func getByPassTypeId(c web.C, res http.ResponseWriter, req *http.Request) {
 //
 //////////////////////////////////////////////////////////////////////////
 func registerDevicePass(c web.C, res http.ResponseWriter, req *http.Request) {
-	db, err := getDbType(c)
-	check(err)
+
+	//POST request to webServiceURL/version/devices/deviceLibraryIdentifier/registrations/passTypeIdentifier/serialNumber
+	log.Printf("[DEBUG] registerDevicePass")
+
+	db, err := GetDbType(c)
+	utils.Check(err)
 
 	var newDevice device         //struct for registering with the device db
 	var newRegister registerPass //struct for the new pass being added to the device
 	var newPass pass             //data of the type of pass being added (used to get updated time tag)
 
-	//POST request to webServiceURL/version/devices/deviceLibraryIdentifier/registrations/passTypeIdentifier/serialNumber
-
 	if !accessToken(req.Header.Get("HTTP_AUTHORIZATION"), c) {
+		log.Printf("[WARN] access token unauthorized: %s", req.Header.Get("HTTP_AUTHORIZATION"))
 		http.Error(res, "unauthorized", 401)
 		return
 	}
 
 	//2. Store the mapping between the device library identifier and the push token in the devices table.
-	readJson(req, &newDevice)
+	utils.ReadJson(req, &newDevice)
 	newDevice.DeviceLibId = c.URLParams["deviceLibraryIdentifier"]
 
 	//3. Store the mapping between the pass (by pass type identifier and serial number) and the device library identifier in the registrations table
-	if !db.FindByID("pass", c.URLParams["passTypeIdentifier"], &newPass) {
+	if !db.FindById("pass", c.URLParams["passTypeIdentifier"], &newPass) {
+		log.Printf("[WARN] pass not found: %s", c.URLParams["passTypeIdentifier"])
 		http.Error(res, "passType not found", 404)
 		return
 	}
@@ -126,7 +149,8 @@ func registerDevicePass(c web.C, res http.ResponseWriter, req *http.Request) {
 	newRegister.SerialNumber = c.URLParams["serialNumber"]       //set serial num
 	newRegister.Updated = newPass.Updated                        //set the last updated time for this pass
 	newDevice.PassList = append(newDevice.PassList, newRegister) //add the pass to the device passList
-	if !db.Merge("clientDevices", newDevice.DeviceLibId, newDevice) {
+	if !db.Merge("clientDevices", "deviceLibId", newDevice.DeviceLibId, newDevice) {
+		log.Printf("[DEBUG] new device pass merged or added: %s", newDevice.DeviceLibId)
 		res.WriteHeader(http.StatusOK) //If the serial number is already registered for this device, return HTTP status 200.
 		return
 	}
@@ -142,9 +166,12 @@ func registerDevicePass(c web.C, res http.ResponseWriter, req *http.Request) {
 //
 //////////////////////////////////////////////////////////////////////////
 func getPassSerialbyDevice(c web.C, res http.ResponseWriter, req *http.Request) {
+
 	//GET request to webServiceURL/version/devices/deviceLibraryIdentifier/registrations/passTypeIdentifier?passesUpdatedSince=tag
-	db, err := getDbType(c)
-	check(err)
+	log.Printf("[DEBUG] getPassSerialbyDevice")
+
+	db, err := GetDbType(c)
+	utils.Check(err)
 
 	//4. Respond with this list of serial numbers and the latest update tag in a JSON payload
 	type serialList struct {
@@ -158,16 +185,17 @@ func getPassSerialbyDevice(c web.C, res http.ResponseWriter, req *http.Request) 
 	updatedTagStr := urlValue.Get("passesUpdatedSince")
 	if updatedTagStr != "" {
 		updatedTag, err = strconv.ParseInt(updatedTagStr, 10, 64)
-		check(err)
+		utils.Check(err)
 	}
-	log.Printf("updated: %d", updatedTag)
+	log.Printf("[DEBUG] updated: %d", updatedTag)
 
 	var userDevice device
 
 	dLId := c.URLParams["deviceLibraryIdentifier"]
 
 	//1. Look at the registrations table and determine which passes the device is registered for.
-	if !db.FindByID("clientDevices", dLId, &userDevice) {
+	if !db.FindById("clientDevices", dLId, &userDevice) {
+		log.Printf("[WARN] device not found: %s", dLId)
 		http.Error(res, "device not found", 404)
 		return
 	}
@@ -187,7 +215,7 @@ func getPassSerialbyDevice(c web.C, res http.ResponseWriter, req *http.Request) 
 		}
 	}
 
-	writeJson(res, result)
+	utils.WriteJson(res, result, true)
 
 }
 
@@ -199,13 +227,15 @@ func getPassSerialbyDevice(c web.C, res http.ResponseWriter, req *http.Request) 
 //////////////////////////////////////////////////////////////////////////
 func getLatestByPassTypeId(c web.C, res http.ResponseWriter, req *http.Request) {
 	//GET request to webServiceURL/version/passes/passTypeIdentifier/serialNumber
+	log.Printf("[DEBUG] getLatestByPassTypeId")
 
 	//TODO: Support standard HTTP caching on this endpoint: check for the If-Modified-Since header and return HTTP status code 304 if the pass has not changed.
 
-	db, err := getDbType(c)
-	check(err)
+	db, err := GetDbType(c)
+	utils.Check(err)
 
 	if !accessToken(req.Header.Get("HTTP_AUTHORIZATION"), c) {
+		log.Printf("[WARN] access token unauthorized: %s", req.Header.Get("HTTP_AUTHORIZATION"))
 		http.Error(res, "unauthorized", 401)
 		return
 	}
@@ -223,10 +253,11 @@ func getLatestByPassTypeId(c web.C, res http.ResponseWriter, req *http.Request) 
 func unregisterDevice(c web.C, res http.ResponseWriter, req *http.Request) {
 	//DELETE request to webServiceURL/version/devices/deviceLibraryIdentifier/registrations/passTypeIdentifier/serialNumber
 
-	db, err := getDbType(c)
-	check(err)
+	db, err := GetDbType(c)
+	utils.Check(err)
 
 	if !accessToken(req.Header.Get("HTTP_AUTHORIZATION"), c) {
+		log.Printf("[WARN] access token unauthorized: %s", req.Header.Get("HTTP_AUTHORIZATION"))
 		http.Error(res, "unauthorized", 401)
 		return
 	}
@@ -237,7 +268,7 @@ func unregisterDevice(c web.C, res http.ResponseWriter, req *http.Request) {
 	newRegister.SerialNumber = c.URLParams["serialNumber"]
 	//newRegister.DeviceLibId = newDevice.DeviceLibId
 	//db.Add("clientRegister", newRegister)
-	db.DelByID("clientDevices", c.URLParams["deviceLibraryIdentifier"]) //Delete the serial and/or pasTypeID from the device listing. (delete device if contains no serials?)
+	db.DelById("clientDevices", c.URLParams["deviceLibraryIdentifier"]) //Delete the serial and/or pasTypeID from the device listing. (delete device if contains no serials?)
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -254,8 +285,8 @@ func logErrors(c web.C, res http.ResponseWriter, req *http.Request) {
 	}
 	var printErr errorLog
 
-	readJson(req, &printErr) //read in the error
+	utils.ReadJson(req, &printErr) //read in the error
 
-	log.Printf("error Message: %s", printErr.message) //log it
+	log.Printf("[ERROR] : %s", printErr.message) //log it
 
 }

@@ -1,0 +1,19 @@
+[Unit]
+Description=Pass Ninja Pass Distribution App on Port 8001
+After=etcd.service
+After=docker.service
+After=ninjadb1.service
+After=ninjawebapp1.service
+Requires=docker.service
+
+[Service]
+TimeoutStartSec=0
+Restart=on-failure
+RestartSec=5
+ExecStartPre=-/usr/bin/docker kill ninjapassapp1
+ExecStartPre=-/usr/bin/docker rm ninjapassapp1
+ExecStart=/usr/bin/docker run --name ninjapassapp1 -v /home/core/cicadaPass/:/go/src/bitbucket.org/cicadaPass -p 8001:10443 -w /go/src/bitbucket.org/cicadaPass passninja/pass-app ./cicadaPass
+ExecStop=/usr/bin/docker stop ninjapassapp1
+
+[Install]
+WantedBy=multi-user.target

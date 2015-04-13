@@ -5,6 +5,28 @@ import (
 	"time"
 )
 
+const (
+	EnterprisePlan = 0     //Unlimited
+	FreePlan       = 5     //Five preview downloads
+	SmallPlan      = 10000 //10,000 downloads per type
+)
+
+//userModel can be any struct that represents a user in a system
+type userModel struct {
+	ID            string    `gorethink:"id"`
+	Email         string    `gorethink:"email"`                  //Email is ID of user
+	User          goth.User `gorethink:"user"`                   //Detailed User info from oauth login
+	Organization  string    `gorethink:"organization,omitempty"` //User organization name
+	OAuthProvider string    `gorethink:"oauth"`                  //User is using OAuth login, not email
+	Created       time.Time `gorethink:"created,omitempty"`      //Account Created time/date
+	LastLogin     time.Time `gorethink:"lastLogin,omitempty"`    //Last login time
+	Subscriber    bool      `gorethink:"subscriber,omitempty"`   //subscriber: true or false? (false could be free trial users)
+	SubStart      time.Time `gorethink:"subStart,omitempty"`     //Subscription start date
+	SubExpiration time.Time `gorethink:"subExpire,omitempty"`    //Subscription expiration date
+	SubPlan       int       `gorethink:"subPlan,omitempty"`      //Subscription plan for this user
+	PassList      []string  `gorethink:"passList,omitempty"`     //A list of the pass Ids this users has made
+}
+
 type registerPass struct {
 	PassTypeId   string    `json:"id" gorethink:"id" valid:"required"`    //Pass type ID
 	SerialNumber string    `json:"serialNumber" gorethink:"serialNumber"` //Serial number that uniquely identifies the pass.
@@ -18,18 +40,19 @@ type device struct {
 }
 
 type pass struct {
-	Id          string            `json:"id" gorethink:"id" valid:"required"`                                  //Pass ID - used for updating, but not sharing
-	Name        string            `json:"name" gorethink:"name" valid:"required"`                              //Pass name for user identification
-	FileName    string            `json:"filename,omitempty" gorethink:"filename,omitempty"`                   //A generated filename for the pass for downloading and sharing
-	UserId      string            `json:"-" gorethink:"userid,omitempty"`                                      //The Id of the pass creator
-	PassType    string            `json:"passtype,omitempty" gorethink:"passtype,omitempty" valid:"passtypes"` //The pass type, boardingpass, coupon, etc.
-	KeyDoc      *passKeys         `json:"keyDoc,omitempty" gorethink:"keyDoc,omitempty"`                       //The pass.json file, all the structs used to create it
-	Images      []passImage       `json:"images,omitempty" gorethink:"images,omitempty"`                       //All the images needed for a pass
-	ManifestDoc map[string]string `json:"manifest,omitempty" gorethink:"manifest,omitempty"`                   //The manifest.json file, used to verify the content of a pass
-	Updated     time.Time         `json:"updated" gorethink:"updated" valid:"required"`                        //when the pass was last updated or created
-	Status      string            `json:"status" gorethink:"status" valid:"required"`                          //Is the pass ready for distribution, in process, or expired
-	CertId      string            `json:"cert,omitempty" gorethink:"cert,omitempty"`                           //Id to the certificate used to sign the pass
-	MutateList  []string          `json:"mutatelist,omitempty" gorethink:"mutatelist,omitempty"`               //List of value keys used to change the pass via the api upon issuing
+	Id          string            `json:"id" gorethink:"id" valid:"required"`                                    //Pass ID - used for updating, but not sharing
+	Name        string            `json:"name" gorethink:"name" valid:"required"`                                //Pass name for user identification
+	FileName    string            `json:"filename,omitempty" gorethink:"filename,omitempty"`                     //A generated filename for the pass for downloading and sharing
+	UserId      string            `json:"-" gorethink:"userid,omitempty"`                                        //The Id of the pass creator
+	PassType    string            `json:"passtype,omitempty" gorethink:"passtype,omitempty" valid:"passtypes"`   //The pass type, boardingpass, coupon, etc.
+	KeyDoc      *passKeys         `json:"keyDoc,omitempty" gorethink:"keyDoc,omitempty"`                         //The pass.json file, all the structs used to create it
+	Images      []passImage       `json:"images,omitempty" gorethink:"images,omitempty"`                         //All the images needed for a pass
+	ManifestDoc map[string]string `json:"manifest,omitempty" gorethink:"manifest,omitempty"`                     //The manifest.json file, used to verify the content of a pass
+	Updated     time.Time         `json:"updated" gorethink:"updated" valid:"required"`                          //when the pass was last updated or created
+	Status      string            `json:"status" gorethink:"status" valid:"required"`                            //Is the pass ready for distribution, in process, or expired
+	CertId      string            `json:"cert,omitempty" gorethink:"cert,omitempty"`                             //Id to the certificate used to sign the pass
+	MutateList  []string          `json:"mutatelist,omitempty" gorethink:"mutatelist,omitempty"`                 //List of value keys used to change the pass via the api upon issuing
+	PassRemain  int               `json:"passremain,omitempty" gorethink:"passremain,omitempty" valid:"numeric"` //count down from plan max number of downloaded passes of this template
 }
 
 /*************************************************************************

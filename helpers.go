@@ -2,7 +2,6 @@ package main
 
 import (
 	"archive/zip"
-	"bitbucket.org/cicadaDev/gocertsigner"
 	"bitbucket.org/cicadaDev/storer"
 	"bitbucket.org/cicadaDev/utils"
 	"crypto/rand"
@@ -11,7 +10,8 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"github.com/slugmobile/govalidator"
+	"github.com/nullboundary/gocertsigner"
+	"github.com/nullboundary/govalidator"
 	"github.com/zenazn/goji/web"
 	"hash/fnv"
 	"io"
@@ -30,26 +30,19 @@ import (
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func generatePass(passId string, serialNum string, res http.ResponseWriter, db storer.Storer) {
+func generatePass(dlPass pass, serialNum string, res http.ResponseWriter, db storer.Storer) {
 
-	var dlPass pass
-
-	//search for the pass by ID in the db
-	if db.FindByIdx("passMutate", "filename", passId, &dlPass) {
-		log.Printf("[DEBUG] found pass: %s in passMutate table", passId)
-		db.DelById("passMutate", passId) //TODO: should be removed ONLY after pass is registered in device.
-	} else if db.FindByIdx("pass", "filename", passId, &dlPass) {
-		log.Printf("[DEBUG] found pass: %s in pass table", passId)
-	} else {
-		log.Printf("[WARN] pass: %s not found", passId)
-		http.Error(res, "pass not found", 404)
-		return
-	}
+	//TODO: decrement pass download count and block ? if pass limit.
 
 	//update pass doc
+	var err error
 	dlPass.KeyDoc.SerialNumber = serialNum
-	dlPass.KeyDoc.PassTypeIdentifier = "pass.ninja.pass.storecard" //set via etcd?
-	dlPass.KeyDoc.TeamIdentifier = "F8QZ9HX5A6"                    //set via etcd
+	dlPass.KeyDoc.PassTypeIdentifier, err = getPassTypeID(dlPass.PassType)
+	if err != nil {
+		log.Printf("[ERROR] pass type ID error: %s to db", err.Error())
+		return
+	}
+	dlPass.KeyDoc.TeamIdentifier = "F8QZ9HX5A6" //set via etcd?
 	dlPass.KeyDoc.FormatVersion = 1
 	dlPass.KeyDoc.WebServiceURL = webServiceURL
 	dlPass.KeyDoc.AuthenticationToken = utils.GenerateToken(tokenPrivateKey, serialNum, passId)
@@ -61,8 +54,9 @@ func generatePass(passId string, serialNum string, res http.ResponseWriter, db s
 	dlLog.UserId = dlPass.UserId
 	dlLog.Downloaded = time.Now()
 
-	if !db.Add("downloadLog", dlLog) {
-		log.Printf("[ERROR] error adding pass download record: %s to db", dlLog.Id)
+	err = db.Add("downloadRecord", dlLog)
+	if err != nil {
+		log.Printf("[ERROR] %s adding pass download record: %s to db", err, dlLog.Id)
 		return
 	}
 
@@ -70,7 +64,7 @@ func generatePass(passId string, serialNum string, res http.ResponseWriter, db s
 	dlPass.ManifestDoc = make(map[string]string)
 
 	//validate the struct before generating a pass
-	_, err := govalidator.ValidateStruct(dlPass)
+	_, err = govalidator.ValidateStruct(dlPass)
 	if err != nil {
 		utils.Check(err)
 		http.Error(res, "malformed pass data, cannot build pass", http.StatusInternalServerError)
@@ -90,19 +84,19 @@ func generatePass(passId string, serialNum string, res http.ResponseWriter, db s
 	file.Write(keyDocBytes)
 
 	//compute sha1 hash for pass.json
-	dlPass.ManifestDoc["pass.json"] = fmt.Sprintf("%x", hashSha1Bytes(keyDocBytes))
+	dlPass.ManifestDoc["pass.json"] = fmt.Sprintf("%x", utils.HashSha1Bytes(keyDocBytes))
 
 	//add all images to the pass zip
 	for i := range dlPass.Images {
 
-		fileExt, imageBytes := decodetoBytes(dlPass.Images[i].ImageData, "png")
+		fileExt, imageBytes := utils.DecodeUriToBytes(dlPass.Images[i].ImageData, "png")
 		fileName := dlPass.Images[i].ImageName + "." + fileExt
 		file = addToZipFile(w, fileName)
 		_, err := file.Write(imageBytes)
 		utils.Check(err)
 
 		//compute sha1 hash for each image file, add to manifest doc
-		dlPass.ManifestDoc[fileName] = fmt.Sprintf("%x", hashSha1Bytes(imageBytes))
+		dlPass.ManifestDoc[fileName] = fmt.Sprintf("%x", utils.HashSha1Bytes(imageBytes))
 	}
 
 	//add the manifest.json file to the zip pass
@@ -112,11 +106,14 @@ func generatePass(passId string, serialNum string, res http.ResponseWriter, db s
 	utils.Check(err)
 	file.Write(manifestBytes)
 
-	//TODO: get documents and stuff from db or etcd
-	pemKey := goCertSigner.FileToBytes("passCerts/pass.ninja.storecard.key.pem")
-	x509cert := goCertSigner.FileToBytes("passCerts/pass.ninja.storecard.cer")
-	caCert := goCertSigner.FileToBytes("passCerts/AppleWWDRCA.cer")
-	signature, err := goCertSigner.SignWithX509PEM(manifestBytes, x509cert, pemKey, p12pass, caCert)
+	passTypeKey := strings.ToLower(dlPass.PassType) //key map is using lower case only!
+	pemKey := keyMap[passTypeKey]                   //get the pem key
+	x509cert := certMap[passTypeKey]                //get the cert
+	caCert := certMap["AppleWWDRCA"]                //get the ca cert
+
+	//pemKey := goCertSigner.FileToBytes("passCerts/pass.ninja.storecard.key.pem")
+	//x509cert := goCertSigner.FileToBytes("passCerts/pass.ninja.storecard.cer")
+	signature, err := goCertSigner.SignWithX509PEM(manifestBytes, x509cert, pemKey, pempass, caCert)
 	utils.Check(err)
 
 	file = addToZipFile(w, "signature")
@@ -151,59 +148,6 @@ func addToZipFile(zWrite *zip.Writer, fileName string) io.Writer {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func hashSha1Json(jsonData interface{}) []byte {
-
-	//compute sha1 hash for json
-	hash := sha1.New()
-	enc := json.NewEncoder(hash) //json encode writes to the hash function
-	enc.Encode(jsonData)
-	return hash.Sum(nil)
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func hashSha1Bytes(hashBytes []byte) []byte {
-
-	//compute sha1 hash of bytes
-	hash := sha1.New()
-	n, err := hash.Write(hashBytes)
-	if n != len(hashBytes) || err != nil {
-		panic(err)
-	}
-	return hash.Sum(nil)
-
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//	generate a hash fnv1a hash. Fast, unique, but insecure! use only for ids and such.
-//  https://programmers.stackexchange.com/questions/49550/which-hashing-algorithm-is-best-for-uniqueness-and-speed
-//
-//////////////////////////////////////////////////////////////////////////
-func generateFnvHashId(hashSeeds ...string) uint32 {
-
-	inputString := strings.Join(hashSeeds, "")
-
-	var randomness int32
-	binary.Read(rand.Reader, binary.LittleEndian, &randomness) //add a little randomness
-	inputString = fmt.Sprintf("%s%x", inputString, randomness)
-
-	h := fnv.New32a()
-	h.Write([]byte(inputString))
-	return h.Sum32()
-
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
 func accessToken(authString string, c web.C) bool {
 
 	//1. Verify that the authentication token is correct.
@@ -226,87 +170,75 @@ func accessToken(authString string, c web.C) bool {
 
 //////////////////////////////////////////////////////////////////////////
 //
-// NotFound is a 404 handler.
 //
-//
-//////////////////////////////////////////////////////////////////////////
-func NotFound(w http.ResponseWriter, r *http.Request) {
-	http.Error(w, "Resource Not Found", 404) //TODO: add 404 error message
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-// encodetoDataUri
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func encodetoDataUri(fileName string, mimeType string, allowTypes ...string) (string, error) {
+func loadPassKeysCerts(passTypes ...string) {
 
-	file, _ := os.Open(fileName) //TODO: change to read in through form or json
-	defer file.Close()
-
-	fileInfo, _ := file.Stat() // FileInfo interface
-	size := fileInfo.Size()    // file size
-
-	data := make([]byte, size)
-
-	contentType := path.Ext(fileName)
-
-	typeFound := false
-	for _, fileType := range allowTypes { //match the type with the allowed types
-		if contentType == fileType {
-			typeFound = true
-			break
-		}
+	for _, passString := range passTypes {
+		//create the key & cert path
+		passKeyPath := fmt.Sprintf("/certs/passCerts/pass.ninja.%s.key.pem", passString)
+		passCertPath := fmt.Sprintf("/certs/passCerts/pass.ninja.%s.cer", passString)
+		//load the key & cert
+		pemKey := goCertSigner.FileToBytes(passKeyPath)
+		x509cert := goCertSigner.FileToBytes(passCertPath)
+		//store in maps
+		keyMap[passString] = pemKey
+		certMap[passString] = x509cert
 	}
 
-	if !typeFound {
-		err := fmt.Errorf("[Error] file type: %s not allowed", contentType)
-		return "", err
-	}
-
-	file.Read(data)
-
-	return fmt.Sprintf("data:%s;base64,%s", mimeType, base64.StdEncoding.EncodeToString(data)), nil
-}
-
-//////////////////////////////////////////////////////////////////////////
-//
-// decodetoBytes
-//
-//
-//////////////////////////////////////////////////////////////////////////
-func decodetoBytes(str string, fileType string) (string, []byte) {
-
-	dataStr := strings.SplitN(str, ",", 2) //seperate data:image/png;base64, from the DataURI
-
-	fieldTest := func(c rune) bool {
-		return !unicode.IsLetter(c) && !unicode.IsNumber(c)
-	}
-	fields := strings.FieldsFunc(dataStr[0], fieldTest) //Fields are: ["data" "image" "png" "base64"]
-	dataExt := fields[2]                                //only need the file extension
-
-	if dataExt != fileType {
-		err := fmt.Errorf("[Error] file type: %s not allowed", dataExt)
-		utils.Check(err)
-	}
-
-	data, err := base64.StdEncoding.DecodeString(dataStr[1]) // [] byte
-	utils.Check(err)
-
-	return dataExt, data
+	//load certificate authority cert.
+	caCert := goCertSigner.FileToBytes("/certs/passCerts/AppleWWDRCA.cer")
+	//add it to certMap
+	certMap["AppleWWDRCA"] = caCert
 
 }
 
 //////////////////////////////////////////////////////////////////////////
 //
-// Encodes data into a 'data:' URI specified at
-// https://developer.mozilla.org/en/data_URIs.
+//
+//
 //
 //////////////////////////////////////////////////////////////////////////
-func dataUrl(data []byte, contentType string) string {
-	return fmt.Sprintf("data:%s;base64,%s",
-		contentType, base64.StdEncoding.EncodeToString(data))
+func announceEtcd() {
+
+	sz := len(bindUrl)
+	servernum := "01"
+	if sz > 2 {
+		servernum = bindUrl[sz-2:]
+	}
+	///vulcand/backends/b1/servers/srv2 '{"URL": "http://localhost:5001"}'
+	utils.HeartBeatEtcd("vulcand/backends/passvendor/servers/svr"+servernum, `{"URL": "`+bindUrl+`"}`, 5)
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//	sets the passtype identifier in the keydoc to match the certificate.
+//	TODO: this solution won't work if we implement user generated certs in the future!
+//
+//////////////////////////////////////////////////////////////////////////
+func getPassTypeID(passType string) (string, error) {
+
+	var passIdent string
+	//get the correct pass type id
+	switch passType {
+	case "boardingPass":
+		passIdent = "pass.ninja.pass.boardingpass"
+	case "coupon":
+		passIdent = "pass.ninja.pass.coupon"
+	case "eventTicket":
+		passIdent = "pass.ninja.pass.eventticket"
+	case "generic":
+		passIdent = "pass.ninja.pass.generic"
+	case "storeCard":
+		passIdent = "pass.ninja.pass.storecard"
+	default:
+		log.Printf("[WARN] Pass type %s not found", passType)
+		return "", fmt.Errorf("the submitted data is malformed")
+	}
+
+	return passIdent, nil
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -403,14 +335,18 @@ func AddDb(c *web.C, h http.Handler) http.Handler {
 
 		if _, ok := c.Env["db"]; !ok { //test is the db is already added
 
+			//connect to db
 			rt := storer.NewReThink()
-			var err error
-			rt.Url, err = utils.GetEtcdKey("db/url") //os.Getenv("PASS_APP_DB_URL")
+			dbConn, err := utils.GetEtcdKey("db/conn")
 			utils.Check(err)
-			rt.Port, err = utils.GetEtcdKey("db/port") //os.Getenv("PASS_APP_DB_PORT")
+
+			//load db info from json file
+			var dbMap map[string]interface{}
+			err = json.Unmarshal([]byte(dbConn), &dbMap)
 			utils.Check(err)
-			rt.DbName, err = utils.GetEtcdKey("db/name") //os.Getenv("PASS_APP_DB_NAME")
-			utils.Check(err)
+			rt.Url = dbMap["url"].(string)
+			rt.Port = dbMap["port"].(string)
+			rt.DbName = dbMap["name"].(string)
 
 			s := storer.Storer(rt) //abstract cb to a Storer
 			s.Conn()

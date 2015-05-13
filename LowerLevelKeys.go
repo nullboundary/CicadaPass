@@ -117,14 +117,10 @@ type Time time.Time
 
 ************************************************************************/
 
-//////////////////////////////////////////////////////////////////////////
-//
-//	value type data input to the rethinkdb is marshaled into sub values of
+//	MarshalRQL takes value type data input to rethinkdb which is marshaled into sub values of
 //	int, float or string
-//
-//////////////////////////////////////////////////////////////////////////
 func (v *value) MarshalRQL() (interface{}, error) {
-	log.Printf("[DEBUG] marshalRQL")
+	log.Printf("[DEBUG] marshalRQL  %+v", v)
 
 	if v.ValueInt != int64(0) {
 		return encoding.Encode(v.ValueInt)
@@ -139,28 +135,34 @@ func (v *value) MarshalRQL() (interface{}, error) {
 	return encoding.Encode(nil)
 }
 
-//////////////////////////////////////////////////////////////////////////
-//
-//	value type data output from the rethinkdb is unmarshaled into a sub value of
+//	UnmarshalRQL takes value type data output from rethinkdb which is unmarshaled into a sub value of
 //	int, float or string
-//
-//////////////////////////////////////////////////////////////////////////
 func (v *value) UnmarshalRQL(b interface{}) error {
 
 	log.Printf("[DEBUG] unmarshalRQL %+v", b)
 	s := ""
-
+	//decode to string first
 	if err := encoding.Decode(&s, b); err == nil {
 		log.Printf("[DEBUG] %T - %s\n", s, s)
 	}
+	//try parse string as int
 	if n, err := strconv.ParseInt(s, 10, 64); err == nil { //FIXME: for "0131" creates "131"
 		log.Printf("[DEBUG] %T - %d\n", n, n)
 		v.ValueInt = n
 		return nil
 	}
+	//try parse string as float
 	if f, err := strconv.ParseFloat(s, 64); err == nil {
-		log.Printf("[DEBUG] %T - %n\n", f, f)
+		log.Printf("[DEBUG] %T - %f\n", f, f)
 		v.ValueFloat = f
+		return nil
+	}
+	f := `2006-01-02T15:04:05.000Z` //convert ISO Z to +- tZ
+	if tt, err := time.Parse(f, s); err == nil {
+		log.Printf("[DEBUG] %T - %s\n", tt, tt.String())
+		iso8601 := "2006-01-02T15:04:05-07:00" //W3C
+		s := tt.Format(iso8601)
+		v.ValueString = s
 		return nil
 	}
 
@@ -172,12 +174,7 @@ func (v *value) UnmarshalRQL(b interface{}) error {
 
 var _ storer.RtValue = (*value)(nil)
 
-//////////////////////////////////////////////////////////////////////////
-//
-//	Handle json unmarshalling from doc to struct of Value types for fields.
-//
-//
-//////////////////////////////////////////////////////////////////////////
+//	UnmarshalJSON handles json unmarshalling from doc to struct of Value types for fields.
 func (v *value) UnmarshalJSON(b []byte) (err error) {
 	n, f, s := int64(0), float64(0), ""
 	log.Printf("[DEBUG] unmarshalJSON")
@@ -197,12 +194,7 @@ func (v *value) UnmarshalJSON(b []byte) (err error) {
 	return
 }
 
-//////////////////////////////////////////////////////////////////////////
-//
-//	Handle json marshalling from struct to doc of Value types for fields.
-//
-//
-//////////////////////////////////////////////////////////////////////////
+//	MarshalJSON handles json marshalling from struct to doc of Value types for fields.
 func (v *value) MarshalJSON() ([]byte, error) {
 
 	if v.ValueInt != 0 {
@@ -217,12 +209,8 @@ func (v *value) MarshalJSON() ([]byte, error) {
 	return json.Marshal(nil)
 }
 
-//////////////////////////////////////////////////////////////////////////
-//
-//	Marshal into Db custom type Time by converting it to a RFC3339
+//	MarshalRQL marshals into Db custom type Time by converting it to a RFC3339
 //	formatted string.
-//
-//////////////////////////////////////////////////////////////////////////
 func (t Time) MarshalRQL() (interface{}, error) {
 
 	s := time.Time(t).Format(time.RFC3339)
@@ -230,13 +218,8 @@ func (t Time) MarshalRQL() (interface{}, error) {
 	return encoding.Encode(s)
 }
 
-//////////////////////////////////////////////////////////////////////////
-//
-//	Unmarshal from Db type time.Time or time formated string by converting
+//	UnmarshalRQL unmarshals from Db type time.Time or time formated string by converting
 //	it to custom type Time
-//
-//
-//////////////////////////////////////////////////////////////////////////
 func (t *Time) UnmarshalRQL(b interface{}) error {
 	log.Printf("[DEBUG] unmarshalRQL")
 	s := ""
@@ -252,11 +235,19 @@ func (t *Time) UnmarshalRQL(b interface{}) error {
 		log.Printf("[DEBUG] %T - %s\n", s, s)
 	}
 
+	//try parsing above string in RFC3339 format
 	if tt, err := time.Parse(time.RFC3339, s); err == nil {
 		*t = Time(tt)
 		return nil
 	}
-	f := "2006-01-02 15:04:05 -0700"
+	//try parsing string in iso8601 format
+	iso8601 := `"2006-01-02T15:04:05-07:00"`
+	if tt, err := time.Parse(iso8601, s); err == nil {
+		*t = Time(tt)
+		return nil
+	}
+
+	f := `"2006-01-02T15:04:05.000Z"`
 	if tt, err := time.Parse(f, s); err == nil {
 		*t = Time(tt)
 		return nil
@@ -268,45 +259,45 @@ func (t *Time) UnmarshalRQL(b interface{}) error {
 	return nil
 }
 
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
+//MarshalJSON handles json marshalling from struct value *Time to string
+//formatted iso8601 W3C Complete date plus hours, minutes and seconds.
 func (t Time) MarshalJSON() ([]byte, error) {
-	//f := "2006-01-02 15:04:05 -0700"
-	s := time.Time(t).Format(time.RFC3339)
+
+	//1997-07-16T19:20:30+01:00
+	iso8601 := "2006-01-02T15:04:05-07:00" //W3C Complete date plus hours, minutes and seconds
+	s := time.Time(t).Format(iso8601)
 	log.Printf("[DEBUG] Time MarshalJson: %s", s)
 	return []byte(fmt.Sprintf(`"%s"`, s)), nil
 }
 
-//////////////////////////////////////////////////////////////////////////
-//
-//
-//
-//
-//////////////////////////////////////////////////////////////////////////
+// 	UnmarshalJSON unmarshals from string to type *Time by parsing
+//	the string. First try RFC3339, then iso8601, etc.
 func (t *Time) UnmarshalJSON(b []byte) error {
 
 	s := string(b)
 	log.Printf("[DEBUG] UnmarshalJSON -time: %s", s)
-	if tt, err := time.Parse(time.RFC3339, s); err == nil {
-		*t = Time(tt)
-		return nil
-	}
 
+	//try parsing string in iso8601 format
 	iso8601 := `"2006-01-02T15:04:05.000Z"`
 	if tt, err := time.Parse(iso8601, s); err == nil {
 		*t = Time(tt)
 		return nil
 	}
 
+	//try parsing string in RFC3339 format
+	if tt, err := time.Parse(time.RFC3339, s); err == nil {
+		*t = Time(tt)
+		return nil
+	}
+
+	//try parsing string in this format
 	f := `"2006-01-02 15:04:05 -0700"`
 	if tt, err := time.Parse(f, s); err == nil {
 		*t = Time(tt)
 		return nil
 	}
+
+	//try parsing string in rubyDate format
 	if tt, err := time.Parse(time.RubyDate, s); err == nil {
 		*t = Time(tt)
 	}

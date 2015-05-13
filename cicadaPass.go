@@ -1,30 +1,33 @@
 package main
 
 import (
-	"bitbucket.org/cicadaDev/utils"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
-	"github.com/hashicorp/logutils"
-	"github.com/zenazn/goji/graceful"
-	"github.com/zenazn/goji/web"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
+
+	"bitbucket.org/cicadaDev/utils"
+	"github.com/hashicorp/logutils"
+	"github.com/zenazn/goji/graceful"
+	"github.com/zenazn/goji/web"
 )
 
 var (
 	tokenPrivateKey = []byte(`y0yArOR5I\)rZT8Kj6NaaJs;{T:h0p1`) //TODO: lets make a new key and put this somewhere safer!
-	webServiceURL   = "https://local.pass.ninja:8001"           //the url of this service (https://vendor.pass.ninja)
+	webServiceURL   = "https://pass.ninja/pass/"                //the url of this service (https://vendor.pass.ninja)
 	pempass         = ""                                        //the password for pass pem keys
 	keyMap          map[string][]byte                           //map of pem keys
 	certMap         map[string][]byte                           //map of certificates
-	bindUrl         string                                      //flag var for binding to a specific port
+	bindURL         string                                      //flag var for binding to a specific port
 	secretKeyring   = "/certs/.secring.gpg"                     //crypt set -keyring .pubring.gpg -endpoint http://10.1.42.1:4001 /passcerts/keypass keypass.json
 )
 
@@ -37,7 +40,7 @@ type downloadLog struct {
 
 func init() {
 
-	flag.StringVar(&bindUrl, "bindurl", "http://localhost:8001", "The public ip address and port number for this server to bind to")
+	flag.StringVar(&bindURL, "bindurl", "http://localhost:8001", "The public ip address and port number for this server to bind to")
 	flag.Parse()
 
 	//add custom validator functions
@@ -133,7 +136,7 @@ func getByPassTypeId(c web.C, res http.ResponseWriter, req *http.Request) {
 	utils.Check(err)
 
 	passId := c.URLParams["passTypeIdentifier"]
-	var dlPass pass
+	dlPass := newPass()
 
 	//search for the pass by ID in the db
 	if ok, _ := db.FindByIdx("passMutate", "filename", passId, &dlPass); ok {
@@ -160,19 +163,34 @@ func getByPassTypeId(c web.C, res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	//decrement 1 pass download
-	dlPass.PassRemain -= 1
-
-	//limit pass download for freeplan
-	if dlPass.PassRemain < 0 && passUser.SubPlan == FreePlan {
+	if ok := dlPass.limitDownloads(passUser); !ok {
 		log.Printf("[ERROR] Exceeded Plan Download Limit %s", dlPass.UserId)
-		utils.JsonErrorResponse(res, fmt.Errorf("Exceeded Plan Download Limit"), http.StatusUnauthorized)
+		utils.JsonErrorResponse(res, fmt.Errorf("Exceeded Plan Download Limit"), http.StatusForbidden)
 		return
 	}
 
-	//generate a unique serial number for this pass being downloaded
-	serialHash := utils.HashSha1Bytes([]byte(req.UserAgent() + time.Now().String()))
-	serial := base64.URLEncoding.EncodeToString(serialHash)
+	//TODO some db magic can problem do this more effectively
+	//decrement 1 pass download and save the decrement.
+	dlPass.PassRemain--
+	_, err = db.Merge("pass", "id", dlPass.Id, dlPass)
+	if err != nil {
+		log.Printf("[ERROR] %s - merging pass: %s to db", err, dlPass.Name)
+		utils.JsonErrorResponse(res, fmt.Errorf("a conflict has occurred"), http.StatusConflict)
+		return
+	}
+
+	//add backfield copy and terms here.
+	err = addBackNotice(dlPass)
+	if err != nil {
+		utils.JsonErrorResponse(res, fmt.Errorf("an error has occurred"), http.StatusInternalServerError)
+		return
+	}
+
+	//generate a unique serial number for this pass being downloaded added to file name
+	serialHash := utils.HashSha1Bytes([]byte(req.UserAgent() + utils.RandomStr(16) + time.Now().String()))
+	fileName := []byte(dlPass.FileName + "|")
+	serialBytes := append(fileName, serialHash...)
+	serial := base64.URLEncoding.EncodeToString(serialBytes)
 
 	generatePass(dlPass, serial, res, db)
 
@@ -196,9 +214,9 @@ func registerDevicePass(c web.C, res http.ResponseWriter, req *http.Request) {
 	var newRegister registerPass //struct for the new pass being added to the device
 	var newPass pass             //data of the type of pass being added (used to get updated time tag)
 
-	if !accessToken(req.Header.Get("HTTP_AUTHORIZATION"), c) {
-		log.Printf("[WARN] access token unauthorized: %s", req.Header.Get("HTTP_AUTHORIZATION"))
-		http.Error(res, http.StatusText(401), 401)
+	if !accessToken(req.Header.Get("Authorization"), c) {
+		log.Printf("[WARN] access token unauthorized: %s", req.Header.Get("Authorization"))
+		http.Error(res, http.StatusText(401), http.StatusUnauthorized)
 		return
 	}
 
@@ -206,14 +224,23 @@ func registerDevicePass(c web.C, res http.ResponseWriter, req *http.Request) {
 	utils.ReadJson(req, &newDevice)
 	newDevice.DeviceLibId = c.URLParams["deviceLibraryIdentifier"]
 
+	//use the serial contains filename to find the pass!
+	decodedSerial, err := base64.URLEncoding.DecodeString(c.URLParams["serialNumber"])
+	if err != nil {
+		log.Printf("[ERROR] %s", err)
+		http.Error(res, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	fileserial := strings.Split(string(decodedSerial), "|")
+
 	//3. Store the mapping between the pass (by pass type identifier and serial number) and the device library identifier in the registrations table
-	if ok, err := db.FindById("pass", c.URLParams["passTypeIdentifier"], &newPass); !ok {
+	if ok, err := db.FindByIdx("pass", "filename", fileserial[0], &newPass); !ok {
 		if err != nil {
 			log.Printf("[ERROR] %s", err)
 		} else {
-			log.Printf("[WARN] pass not found: %s", c.URLParams["passTypeIdentifier"])
+			log.Printf("[WARN] pass not found: %s", fileserial[0])
 		}
-		http.Error(res, "passType not found", 404)
+		http.Error(res, "passType not found", http.StatusNotFound)
 		return
 	}
 
@@ -254,7 +281,7 @@ func getPassSerialbyDevice(c web.C, res http.ResponseWriter, req *http.Request) 
 	//4. Respond with this list of serial numbers and the latest update tag in a JSON payload
 	type serialList struct {
 		SerialNumbers []string `json:"serialNumbers"` //list of passes to be updated
-		LastUpdated   int64    `json:"lastUpdated"`   //the time of the most recent pass update
+		LastUpdated   string   `json:"lastUpdated"`   //the time of the most recent pass update
 	}
 	var result serialList
 
@@ -284,19 +311,27 @@ func getPassSerialbyDevice(c web.C, res http.ResponseWriter, req *http.Request) 
 
 	passList := userDevice.PassList
 
-	for i := range passList { //TODO: Could this be sorted on the db?
+	lastUpdate := updatedTag
+	for i := range passList {
 		//2. Look at the passes table and determine which passes have changed since the given tag. Don’t include serial numbers of passes that the device didn’t register for.
-		if passList[i].Updated.Unix() >= updatedTag {
+		if passList[i].Updated.Unix() > updatedTag {
 			result.SerialNumbers = append(result.SerialNumbers, passList[i].SerialNumber)
 
 			//3. Compare the update tags for each pass that has changed and determine which one is the latest.
-			if passList[i].Updated.Unix() >= result.LastUpdated {
-				result.LastUpdated = passList[i].Updated.Unix()
-
+			if passList[i].Updated.Unix() > lastUpdate {
+				lastUpdate = passList[i].Updated.Unix()
 			}
+
 		}
 	}
 
+	if result.SerialNumbers == nil || len(result.SerialNumbers) == 0 {
+		log.Printf("[DEBUG] No Passes to Update")
+		res.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	result.LastUpdated = fmt.Sprintf("%d", lastUpdate) //convert the unix timestamp to a string
 	utils.WriteJson(res, result, true)
 
 }
@@ -316,13 +351,47 @@ func getLatestByPassTypeId(c web.C, res http.ResponseWriter, req *http.Request) 
 	db, err := GetDbType(c)
 	utils.Check(err)
 
-	if !accessToken(req.Header.Get("HTTP_AUTHORIZATION"), c) {
-		log.Printf("[WARN] access token unauthorized: %s", req.Header.Get("HTTP_AUTHORIZATION"))
+	if !accessToken(req.Header.Get("Authorization"), c) {
+		log.Printf("[WARN] access token unauthorized: %s", req.Header.Get("Authorization"))
 		http.Error(res, http.StatusText(401), 401)
 		return
 	}
 
-	generatePass(c.URLParams["passTypeIdentifier"], c.URLParams["serialNumber"], res, db)
+	passId := c.URLParams["passTypeIdentifier"]
+	dlPass := newPass()
+
+	//use the serial contains filename to find the pass!
+	decodedSerial, err := base64.URLEncoding.DecodeString(c.URLParams["serialNumber"])
+	if err != nil {
+		log.Printf("[ERROR] %s", err)
+		http.Error(res, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+	fileserial := strings.Split(string(decodedSerial), "|")
+
+	//search for the pass by ID in the db
+	if ok, _ := db.FindByIdx("passMutate", "filename", fileserial[0], &dlPass); ok {
+		log.Printf("[DEBUG] found pass: %s in passMutate table", fileserial[0])
+		err := db.DelById("passMutate", passId) //TODO: should be removed ONLY after pass is registered in device.
+		if err != nil {
+			log.Printf("[ERROR] %s", err)
+			return
+		}
+	} else if ok, _ := db.FindByIdx("pass", "filename", fileserial[0], &dlPass); ok {
+		log.Printf("[DEBUG] found pass: %s in pass table", fileserial[0])
+	} else {
+		log.Printf("[WARN] pass: %s not found", fileserial[0])
+		http.Error(res, "pass not found", 404)
+		return
+	}
+
+	modtime := dlPass.Updated
+	if t, err := time.Parse(http.TimeFormat, req.Header.Get("If-Modified-Since")); err == nil && modtime.Before(t.Add(1*time.Second)) {
+		res.WriteHeader(http.StatusNotModified)
+		return
+	}
+
+	generatePass(dlPass, c.URLParams["serialNumber"], res, db)
 
 }
 
@@ -338,11 +407,12 @@ func unregisterDevice(c web.C, res http.ResponseWriter, req *http.Request) {
 	db, err := GetDbType(c)
 	utils.Check(err)
 
-	if !accessToken(req.Header.Get("HTTP_AUTHORIZATION"), c) {
-		log.Printf("[WARN] access token unauthorized: %s", req.Header.Get("HTTP_AUTHORIZATION"))
+	if !accessToken(req.Header.Get("Authorization"), c) {
+		log.Printf("[WARN] access token unauthorized: %s", req.Header.Get("Authorization"))
 		http.Error(res, http.StatusText(401), 401)
 		return
 	}
+	log.Printf("[DEBUG] unregisterDevice %s", c.URLParams["serialNumber"])
 
 	var newRegister registerPass
 
@@ -368,14 +438,15 @@ func logErrors(c web.C, res http.ResponseWriter, req *http.Request) {
 	//POST webServiceURL/version/log
 
 	type errorLog struct {
-		message string `json:"error"`
+		Logs []string `json:"logs"`
 	}
 	var printErr errorLog
 
 	utils.ReadJson(req, &printErr) //read in the error
 
-	log.Printf("[ERROR] : %s", printErr.message) //log it
-
+	for _, logMsg := range printErr.Logs {
+		log.Printf("[ERROR] : %s", logMsg) //log it
+	}
 }
 
 //////////////////////////////////////////////////////////////////////////

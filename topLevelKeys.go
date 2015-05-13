@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"log"
 	"time"
 )
 
@@ -11,11 +13,11 @@ const (
 	SmallPlan      = 10000 //10,000 downloads per type
 )
 
-//userModel can be any struct that represents a user in a system
+//userModel struct represents a user in the system
 type userModel struct {
-	ID            string    `gorethink:"id"`
-	Email         string    `gorethink:"email"`                  //Email is ID of user
-	User          goth.User `gorethink:"user"`                   //Detailed User info from oauth login
+	ID    string `gorethink:"id"`
+	Email string `gorethink:"email"` //Email is ID of user
+	//User          goth.User `gorethink:"user"`                   //Detailed User info from oauth login
 	Organization  string    `gorethink:"organization,omitempty"` //User organization name
 	OAuthProvider string    `gorethink:"oauth"`                  //User is using OAuth login, not email
 	Created       time.Time `gorethink:"created,omitempty"`      //Account Created time/date
@@ -161,4 +163,70 @@ type passKeys struct {
 
 	AuthenticationToken string `json:"authenticationToken,omitempty" gorethink:"authenticationToken,omitempty"`    //The authentication token to use with the web service. The token must be 16 characters or longer.
 	WebServiceURL       string `json:"webServiceURL,omitempty" gorethink:"webServiceURL,omitempty" valid:"requrl"` //The URL of a web service
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//	newPass returns a pointer to a pass.
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func newPass() *pass {
+	return &pass{}
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//
+//
+//
+//////////////////////////////////////////////////////////////////////////
+func (p *pass) getPassStructure() (*passStructure, error) {
+
+	//get the correct pass type keyDoc
+	var keyDocType *passStructure
+	switch p.PassType {
+	case "boardingPass":
+		keyDocType = p.KeyDoc.BoardingPass
+	case "coupon":
+		keyDocType = p.KeyDoc.Coupon
+	case "eventTicket":
+		keyDocType = p.KeyDoc.EventTicket
+	case "generic":
+		keyDocType = p.KeyDoc.Generic
+	case "storeCard":
+		keyDocType = p.KeyDoc.StoreCard
+	default:
+		log.Printf("[WARN] Pass type %s not found", p.PassType)
+		return keyDocType, fmt.Errorf("the submitted pass type is malformed")
+	}
+	return keyDocType, nil
+}
+
+//////////////////////////////////////////////////////////////////////////
+//
+//	setPassTypeIdentifier sets the passtype identifier in the keydoc to match the certificate.
+//	TODO: this solution won't work if we implement user generated certs in the future!
+//
+//////////////////////////////////////////////////////////////////////////
+func (p *pass) setPassTypeIdentifier() error {
+
+	//get the correct pass type id
+	switch p.PassType {
+	case "boardingPass":
+		p.KeyDoc.PassTypeIdentifier = "pass.ninja.pass.boardingpass"
+	case "coupon":
+		p.KeyDoc.PassTypeIdentifier = "pass.ninja.pass.coupon"
+	case "eventTicket":
+		p.KeyDoc.PassTypeIdentifier = "pass.ninja.pass.eventticket"
+	case "generic":
+		p.KeyDoc.PassTypeIdentifier = "pass.ninja.pass.generic"
+	case "storeCard":
+		p.KeyDoc.PassTypeIdentifier = "pass.ninja.pass.storecard"
+	default:
+		log.Printf("[WARN] Pass type %s not found", p.PassType)
+		return fmt.Errorf("the submitted data is malformed")
+	}
+
+	return nil
 }

@@ -21,6 +21,12 @@ if [ "$CMD" == "deploy" ]; then
 	exit 0
 #all
 elif [ "$CMD" == "build" ]; then
+	echo Linting...
+	docker run --rm -v $PWD:/go/src/bitbucket.org/$TARGET $IMAGE golint
+	echo --------------------------------------------------------------
+	echo Vetting...
+	docker run --rm -v $PWD:/go/src/bitbucket.org/$TARGET $IMAGE go vet
+	echo --------------------------------------------------------------
 	echo Building...
 	docker run --rm -v $PWD:/go/src/bitbucket.org/$TARGET $IMAGE go build -v
 	exit 0

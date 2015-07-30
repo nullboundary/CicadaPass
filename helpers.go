@@ -5,13 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	"bitbucket.org/cicadaDev/datamodels"
 	"bitbucket.org/cicadaDev/storer"
 	"bitbucket.org/cicadaDev/utils"
+	log "github.com/Sirupsen/logrus"
 	"github.com/nullboundary/gocertsigner"
 	"github.com/nullboundary/govalidator"
 	"github.com/zenazn/goji/web"
@@ -23,13 +24,13 @@ import (
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func generatePass(dlPass *pass, serialNum string, res http.ResponseWriter, db storer.Storer) {
+func generatePass(dlPass *dataModels.Pass, serialNum string, res http.ResponseWriter, db storer.Storer) {
 
 	//update pass doc
 	dlPass.KeyDoc.SerialNumber = serialNum
-	err := dlPass.setPassTypeIdentifier() //passtype sets the identifier
+	err := dlPass.SetPassTypeIdentifier() //passtype sets the identifier
 	if err != nil {
-		log.Printf("[ERROR] pass type ID error: %s to db", err.Error())
+		log.Errorf("pass type ID error: %s to db", err.Error())
 		return
 	}
 	dlPass.KeyDoc.TeamIdentifier = "F8QZ9HX5A6" //TODO: set via etcd?
@@ -46,7 +47,7 @@ func generatePass(dlPass *pass, serialNum string, res http.ResponseWriter, db st
 
 	err = db.Add("downloadRecord", dlLog)
 	if err != nil {
-		log.Printf("[ERROR] %s adding pass download record: %s to db", err, dlLog.Id)
+		log.WithField("passid", dlLog.Id).Errorf("error adding pass download record to db %s", err)
 		return
 	}
 
@@ -54,9 +55,9 @@ func generatePass(dlPass *pass, serialNum string, res http.ResponseWriter, db st
 	dlPass.ManifestDoc = make(map[string]string)
 
 	//validate the struct before generating a pass
-	_, err = govalidator.ValidateStruct(dlPass)
+	result, err := govalidator.ValidateStruct(dlPass)
 	if err != nil {
-		utils.Check(err)
+		log.Errorf("validated: %t - validation error: %s", result, err.Error())
 		http.Error(res, "malformed pass data, cannot build pass", http.StatusInternalServerError)
 		return
 	}
@@ -72,7 +73,9 @@ func generatePass(dlPass *pass, serialNum string, res http.ResponseWriter, db st
 	//add the pass.json file to the zip pass
 	file := addToZipFile(w, "pass.json")
 	keyDocBytes, err := json.MarshalIndent(dlPass.KeyDoc, "", "  ") //pretty print json doc
-	utils.Check(err)
+	if err != nil {
+		log.WithField("passid", dlPass.Id).Errorf("error marshaling keydoc %s", err)
+	}
 	file.Write(keyDocBytes)
 
 	//compute sha1 hash for pass.json
@@ -85,7 +88,9 @@ func generatePass(dlPass *pass, serialNum string, res http.ResponseWriter, db st
 		fileName := dlPass.Images[i].ImageName + "." + fileExt
 		file = addToZipFile(w, fileName)
 		_, err := file.Write(imageBytes)
-		utils.Check(err)
+		if err != nil {
+			log.WithField("image", dlPass.Images[i].ImageName).Errorf("error writing image to zip %s", err)
+		}
 
 		//compute sha1 hash for each image file, add to manifest doc
 		dlPass.ManifestDoc[fileName] = fmt.Sprintf("%x", utils.HashSha1Bytes(imageBytes))
@@ -95,7 +100,9 @@ func generatePass(dlPass *pass, serialNum string, res http.ResponseWriter, db st
 	file = addToZipFile(w, "manifest.json")
 	//read in certificates and manifest as bytes
 	manifestBytes, err := json.MarshalIndent(dlPass.ManifestDoc, "", "  ")
-	utils.Check(err)
+	if err != nil {
+		log.WithField("passid", dlPass.Id).Errorf("error marshaling manifest doc %s", err)
+	}
 	file.Write(manifestBytes)
 
 	passTypeKey := strings.ToLower(dlPass.PassType) //key map is using lower case only!
@@ -106,11 +113,15 @@ func generatePass(dlPass *pass, serialNum string, res http.ResponseWriter, db st
 	//pemKey := goCertSigner.FileToBytes("passCerts/pass.ninja.storecard.key.pem")
 	//x509cert := goCertSigner.FileToBytes("passCerts/pass.ninja.storecard.cer")
 	signature, err := goCertSigner.SignWithX509PEM(manifestBytes, x509cert, pemKey, pempass, caCert)
-	utils.Check(err)
+	if err != nil {
+		log.WithField("passid", dlPass.Id).Errorf("error signing pass %s", err)
+	}
 
 	file = addToZipFile(w, "signature")
 	_, err = file.Write(signature)
-	utils.Check(err)
+	if err != nil {
+		log.WithField("passid", dlPass.Id).Errorf("error adding signature to zip %s", err)
+	}
 
 }
 
@@ -128,7 +139,9 @@ func addToZipFile(zWrite *zip.Writer, fileName string) io.Writer {
 	header.SetModTime(time.Now().UTC()) //sets modify and create times
 	header.SetMode(0644)                //set all files to -rw-r--r--
 	file, err := zWrite.CreateHeader(&header)
-	utils.Check(err)
+	if err != nil {
+		log.WithField("header", header.Name).Errorf("error adding zip header %s", err)
+	}
 
 	return file
 
@@ -151,7 +164,7 @@ func accessToken(authString string, c web.C) bool {
 	if ok, err := utils.VerifyToken(tokenPrivateKey, authToken, c.URLParams["serialNumber"], c.URLParams["passTypeIdentifier"]); !ok {
 
 		if err != nil {
-			utils.Check(err)
+			log.WithField("token", authToken).Errorf("error verifying token %s", err)
 		}
 		return false //verify failed
 	}
@@ -210,14 +223,14 @@ func announceEtcd() {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func addBackNotice(dlPass *pass) error {
+func addBackNotice(dlPass *dataModels.Pass) error {
 
-	keyDocType, err := dlPass.getPassStructure()
+	keyDocType, err := dlPass.GetPassStructure()
 	if err != nil {
 		return err
 	}
-	msg := &value{ValueString: "This pass was generated by https://pass.ninja for sample viewing and beta testing."}
-	notice := fields{Key: "passNinjaNotice", Value: msg}
+	msg := &dataModels.Value{ValueString: "This pass was generated by https://pass.ninja for sample viewing and beta testing."}
+	notice := dataModels.Fields{Key: "passNinjaNotice", Value: msg}
 	keyDocType.BackFields = append(keyDocType.BackFields, notice)
 
 	return nil
@@ -229,19 +242,19 @@ func addBackNotice(dlPass *pass) error {
 //
 //
 //////////////////////////////////////////////////////////////////////////
-func (p *pass) limitDownloads(passUser *userModel) bool {
+func limitDownloads(p *dataModels.Pass, passUser *dataModels.UserModel) bool {
 	//pass downloads count down from maximum limit
 
 	//limit pass download for freeplan
-	if p.PassRemain > 0 && passUser.SubPlan == FreePlan {
+	if p.PassRemain > 0 && passUser.SubPlan == dataModels.FreePlan {
 		return true
 	}
 	//TODO: small plan should allow less then zero, but charge for it.
-	if p.PassRemain > 0 && passUser.SubPlan == SmallPlan {
+	if p.PassRemain > 0 && passUser.SubPlan == dataModels.SmallPlan {
 		return true
 	}
 	//enterprise plans start counting at 0 and count into negative to mean unlimited
-	if p.PassRemain <= 0 && passUser.SubPlan == EnterprisePlan {
+	if p.PassRemain <= 0 && passUser.SubPlan == dataModels.EnterprisePlan {
 		return true
 	}
 
@@ -335,26 +348,29 @@ func addListValidator(key string, typeList []string) {
 //
 //////////////////////////////////////////////////////////////////////////
 func AddDb(c *web.C, h http.Handler) http.Handler {
-	handler := func(w http.ResponseWriter, r *http.Request) {
 
-		if c.Env == nil {
-			c.Env = make(map[interface{}]interface{})
-		}
+	handler := func(w http.ResponseWriter, r *http.Request) {
 
 		if _, ok := c.Env["db"]; !ok { //test is the db is already added
 
 			//connect to db
 			rt := storer.NewReThink()
-			dbConn, err := utils.GetEtcdKey("db/conn")
-			utils.Check(err)
 
 			//load db info from json file
+			dbConn, err := utils.GetCryptKey(secretKeyRing, "db/conn")
+			if err != nil {
+				log.Fatalf("error loading db keys from etcd %s", err)
+			}
 			var dbMap map[string]interface{}
 			err = json.Unmarshal([]byte(dbConn), &dbMap)
-			utils.Check(err)
+			if err != nil {
+				log.Fatalf("error unmarshaling db keys from etcd %s", err)
+			}
+
 			rt.Url = dbMap["url"].(string)
 			rt.Port = dbMap["port"].(string)
 			rt.DbName = dbMap["name"].(string)
+			rt.AuthKey = dbMap["authKey"].(string)
 
 			s := storer.Storer(rt) //abstract cb to a Storer
 			s.Conn()

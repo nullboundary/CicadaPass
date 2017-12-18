@@ -1,5 +1,5 @@
 FROM golang:1.4.2-wheezy
-MAINTAINER Noah Shibley <pass.ninja@gmail.com>
+MAINTAINER Noah Shibley <pass.ninja@mail.com>
 #Build environment container for Pass Ninja Vendor app
 
 #apt-get update

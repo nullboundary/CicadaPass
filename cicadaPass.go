@@ -22,8 +22,8 @@ import (
 )
 
 var (
-	tokenPrivateKey = []byte(`y0yArOR5I\)rZT8Kj6NaaJs;{T:h0p1`) //TODO: lets make a new key and put this somewhere safer!
-	webServiceURL   = "https://pass.ninja/pass/"                //the url of this service (https://vendor.pass.ninja)
+	tokenPrivateKey = []byte(``) //TODO: lets make a new key and put this somewhere safer!
+	webServiceURL   = "https://example.com/"                //the url of this service (https://vendor.pass.ninja)
 	pempass         = ""                                        //the password for pass pem keys
 	keyMap          map[string][]byte                           //map of pem keys
 	certMap         map[string][]byte                           //map of certificates
